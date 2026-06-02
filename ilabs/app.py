@@ -69,9 +69,12 @@ class ILabManagerApp:
         self._sort_col = "created_at"
         self._sort_rev = True
         self._core_id: int | None = CORE_ID
+        # Shared var used by both the Track Work and Training tabs
+        self._class_taken_var = tk.BooleanVar()
 
         self._build_ui()
         self._refresh_table()
+        self._restore_last_sync()
 
     # =========================================================================
     # UI construction
@@ -104,6 +107,7 @@ class ILabManagerApp:
         ttk.Button(bar, text="Clear All Requests",      command=self._on_clear_all).pack(side="left", padx=2)
         ttk.Button(bar, text="Import iLab Export CSV…", command=self._on_import).pack(side="left", padx=2)
         ttk.Button(bar, text="Export to CSV…",          command=self._on_export).pack(side="left", padx=2)
+        ttk.Button(bar, text="👥 User Permissions",      command=self._on_user_permissions).pack(side="right", padx=2)
         ttk.Button(bar, text="⚙  Preferences",          command=self._on_open_preferences).pack(side="right", padx=(0, 4))
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
@@ -156,21 +160,25 @@ class ILabManagerApp:
         cols = [
             "request_id", "created_at", "owner_name", "pi_name",
             "service_name", "state", "assigned_to", "labels",
-            "core_lab", "microscope", "training_date", "class_taken",
+            "core_lab", "microscope",
+            "training_date", "training_day", "training_time",
+            "class_taken",
         ]
         headers = {
-            "request_id":   ("ID",           75),
-            "created_at":   ("Submitted",    110),
-            "owner_name":   ("Requester",    155),
-            "pi_name":      ("PI",           150),
-            "service_name": ("Service",      200),
-            "state":        ("State",        115),
-            "assigned_to":  ("Assigned To",  130),
-            "labels":       ("Labels",       140),
-            "core_lab":     ("Core",          55),
-            "microscope":   ("Microscope",   120),
-            "training_date":("Trng Date",     88),
-            "class_taken":  ("Class",         48),
+            "request_id":    ("ID",          75),
+            "created_at":    ("Submitted",    105),
+            "owner_name":    ("Requester",   150),
+            "pi_name":       ("Lab",         145),
+            "service_name":  ("Service",     195),
+            "state":         ("Status",      120),
+            "assigned_to":   ("Assigned To", 125),
+            "labels":        ("Labels",      135),
+            "core_lab":      ("Core",         52),
+            "microscope":    ("Microscope",  115),
+            "training_date": ("Trng Date",    88),
+            "training_day":  ("Day",          52),
+            "training_time": ("Time",         68),
+            "class_taken":   ("Class",        46),
         }
 
         self._tree = ttk.Treeview(frame, columns=cols, show="headings",
@@ -192,6 +200,7 @@ class ILabManagerApp:
         self._tree.pack(fill="both", expand=True)
 
         self._tree.bind("<<TreeviewSelect>>", self._on_row_select)
+        self._tree.bind("<ButtonRelease-1>",  self._on_tree_click)
         self._tree.bind("<Double-1>",         self._on_open_in_ilab)
 
     # ── Detail panel ─────────────────────────────────────────────────────────
@@ -200,6 +209,8 @@ class ILabManagerApp:
         outer = ttk.LabelFrame(parent, text="Request Details", padding=4)
         parent.add(outer, weight=2)
 
+        self._build_quick_actions_bar(outer)
+
         self._notebook = ttk.Notebook(outer)
         self._notebook.pack(fill="both", expand=True)
 
@@ -207,6 +218,41 @@ class ILabManagerApp:
         self._build_form_tab()
         self._build_milestones_tab()
         self._build_training_tab()
+
+    # ── Quick-actions bar (milestone buttons, always visible) ─────────────────
+
+    def _build_quick_actions_bar(self, parent) -> None:
+        self._qa_outer = ttk.Frame(parent)
+        self._qa_outer.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(self._qa_outer, text="Track Work:",
+                  font=("", 9, "bold")).pack(side="left", padx=(4, 8))
+
+        # Scrollable canvas so many milestones don't overflow
+        self._qa_canvas = tk.Canvas(self._qa_outer, height=28,
+                                     highlightthickness=0)
+        qa_hsb = ttk.Scrollbar(self._qa_outer, orient="horizontal",
+                                command=self._qa_canvas.xview)
+        self._qa_canvas.configure(xscrollcommand=qa_hsb.set)
+        # Only show scrollbar when needed; pack canvas first so label stays left
+        self._qa_canvas.pack(side="top", fill="x", expand=True)
+        qa_hsb.pack(side="top", fill="x")
+
+        self._qa_inner = ttk.Frame(self._qa_canvas)
+        self._qa_win   = self._qa_canvas.create_window(
+            (0, 0), window=self._qa_inner, anchor="nw")
+
+        self._qa_inner.bind("<Configure>",
+            lambda e: self._qa_canvas.configure(
+                scrollregion=self._qa_canvas.bbox("all")))
+        self._qa_canvas.bind("<Configure>",
+            lambda e: self._qa_canvas.itemconfig(self._qa_win, width=e.width))
+
+        ttk.Label(self._qa_inner,
+                  text="← select a request",
+                  foreground="#888").pack(side="left", padx=6, pady=4)
+
+        ttk.Separator(parent, orient="horizontal").pack(fill="x", pady=(0, 4))
 
     def _build_info_tab(self) -> None:
         tab = ttk.Frame(self._notebook, padding=10)
@@ -225,14 +271,14 @@ class ILabManagerApp:
         ilab_fields = [
             ("request_id",  "Request ID"),
             ("name",        "Name"),
-            ("state",       "State"),
+            ("state",       "Status"),
             ("created_at",  "Submitted"),
             ("start_on",    "Start Date"),
             ("end_on",      "End Date"),
             ("completed_on","Completed"),
             ("owner_name",  "Requester"),
             ("owner_email", "Email"),
-            ("pi_name",     "PI"),
+            ("pi_name",     "Lab / PI"),
             ("service_name","Service"),
         ]
         for i, (key, label) in enumerate(ilab_fields, start=1):
@@ -324,30 +370,82 @@ class ILabManagerApp:
         self._form_placeholder.grid(row=0, column=0, padx=12, pady=12)
 
     def _build_milestones_tab(self) -> None:
-        tab = ttk.Frame(self._notebook, padding=8)
+        """Track Work tab — custom pre/post-training workflow checklist."""
+        tab = ttk.Frame(self._notebook, padding=10)
         self._notebook.add(tab, text="  Track Work  ")
 
-        # Outer scrollable container
-        canvas = tk.Canvas(tab, highlightthickness=0)
-        vsb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(fill="both", expand=True)
+        # ── Workflow BooleanVars ───────────────────────────────────────────────
+        self._wf_vars = {
+            "wf_emailed":            tk.BooleanVar(),
+            "wf_class_scheduled":    tk.BooleanVar(),
+            "wf_not_required":       tk.BooleanVar(),
+            "wf_training_scheduled": tk.BooleanVar(),
+            "wf_post_email":         tk.BooleanVar(),
+            "wf_post_listserve":     tk.BooleanVar(),
+            "wf_post_approved":      tk.BooleanVar(),
+            "wf_post_confirmed":     tk.BooleanVar(),
+        }
 
-        self._ms_inner = ttk.Frame(canvas)
-        canvas_win = canvas.create_window((0, 0), window=self._ms_inner, anchor="nw")
+        def _save_wf():
+            """Auto-save when any checkbox is ticked."""
+            if not self._current_rec:
+                return
+            req_id = self._current_rec["request_id"]
+            fields = {k: ("1" if v.get() else "0") for k, v in self._wf_vars.items()}
+            self._data.update_local_fields(req_id, **fields)
+            self._current_rec.update(fields)
+            self._update_quick_actions()
 
-        self._ms_inner.bind("<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-            lambda e: canvas.itemconfig(canvas_win, width=e.width))
+        def _chk(parent, key, label, url=None):
+            """Build one checkbox row, with an optional hyperlink on the label."""
+            row = ttk.Frame(parent)
+            row.pack(anchor="w", pady=3)
+            ttk.Checkbutton(row, variable=self._wf_vars[key],
+                            command=_save_wf).pack(side="left")
+            if url:
+                lbl = ttk.Label(row, text=label,
+                                foreground="#1565C0", cursor="hand2")
+                lbl.pack(side="left")
+                lbl.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+            else:
+                ttk.Label(row, text=label).pack(side="left")
 
-        self._ms_canvas = canvas
-        self._ms_placeholder = ttk.Label(
-            self._ms_inner,
-            text="Select a request to view milestones.",
-            foreground="#888")
-        self._ms_placeholder.grid(row=0, column=0, padx=12, pady=12)
+        # ── Two-column layout ─────────────────────────────────────────────────
+        cols = ttk.Frame(tab)
+        cols.pack(fill="both", expand=True)
+
+        # Pre-Training column
+        pre = ttk.LabelFrame(cols, text="Pre-Training", padding=10)
+        pre.pack(side="left", fill="both", expand=True, padx=(0, 6))
+
+        _chk(pre, "wf_emailed",            "Emailed User")
+        _chk(pre, "wf_class_scheduled",    "Class Scheduled")
+        _chk(pre, "wf_not_required",       "Not Required (class)")
+
+        # Class Taken row — shares the Training tab's class_taken var
+        ct_row = ttk.Frame(pre)
+        ct_row.pack(anchor="w", pady=3)
+        ttk.Checkbutton(ct_row, variable=self._class_taken_var,
+                        command=self._on_class_taken_toggle).pack(side="left")
+        ttk.Label(ct_row, text="Class Taken").pack(side="left")
+
+        _chk(pre, "wf_training_scheduled", "Training Scheduled")
+
+        # Post-Training column
+        post = ttk.LabelFrame(cols, text="Post-Training", padding=10)
+        post.pack(side="left", fill="both", expand=True, padx=(6, 0))
+
+        _chk(post, "wf_post_email",
+             "Post-Training Email")
+        _chk(post, "wf_post_listserve",
+             "List Serve",
+             url="https://listsrv.ucsf.edu/")
+        _chk(post, "wf_post_approved",
+             "Training Approved",
+             url="https://ucsf.ilab.agilent.com/sc/5226/"
+                 "center-for-advanced-light-microscopy/?tab=people")
+        _chk(post, "wf_post_confirmed",
+             "Confirmed in iLab")
 
     # ── Training tab ─────────────────────────────────────────────────────────
 
@@ -355,13 +453,12 @@ class ILabManagerApp:
         tab = ttk.Frame(self._notebook, padding=10)
         self._notebook.add(tab, text="  Training  ")
 
-        # Variables
+        # Variables (_class_taken_var is shared with Track Work tab; created in __init__)
         self._training_core_var  = tk.StringVar()
         self._training_micro_var = tk.StringVar()
         self._training_date_var  = tk.StringVar()
         self._training_day_var   = tk.StringVar()
         self._training_time_var  = tk.StringVar()
-        self._class_taken_var    = tk.BooleanVar()
 
         left  = ttk.Frame(tab)
         right = ttk.Frame(tab)
@@ -514,7 +611,14 @@ class ILabManagerApp:
         self._tree.delete(*self._tree.get_children())
         for rec in records:
             state = rec.get("state", "")
-            date  = (rec.get("created_at") or "")[:10]
+            raw = (rec.get("created_at") or "")
+            # Strip milliseconds and timezone so fromisoformat works on all
+            # Python versions (submitted_at looks like "2024-12-20T17:39:44.000-05:00")
+            raw = raw[:19].replace("T", " ")
+            try:
+                date = datetime.fromisoformat(raw).strftime("%d %b %Y")
+            except ValueError:
+                date = raw[:10]
             self._tree.insert(
                 "", "end",
                 iid=rec["request_id"],
@@ -530,7 +634,9 @@ class ILabManagerApp:
                     rec.get("core_lab", ""),
                     rec.get("microscope", ""),
                     rec.get("training_date", ""),
-                    "✓" if rec.get("class_taken") == "1" else "",
+                    rec.get("training_day", ""),
+                    rec.get("training_time", ""),
+                    "☑" if rec.get("class_taken") == "1" else "☐",
                 ),
                 tags=(state,),
             )
@@ -550,6 +656,21 @@ class ILabManagerApp:
     # =========================================================================
 
     def _load_detail(self, rec: dict) -> None:
+        req_id    = rec.get("request_id", "")
+        form_data = json.loads(rec.get("form_data") or "{}")
+
+        # ── Auto-fill core_lab if blank ───────────────────────────────────────
+        if not rec.get("core_lab"):
+            core = _detect_core_from_form(form_data)
+            if core:
+                self._data.update_local_fields(req_id, core_lab=core)
+                rec["core_lab"] = core
+                # update the tree cell immediately
+                try:
+                    self._tree.set(req_id, "core_lab", core)
+                except Exception:
+                    pass
+
         # ── Info tab ──────────────────────────────────────────────────────────
         for key, var in self._info_vars.items():
             var.set(rec.get(key, "") or "")
@@ -589,9 +710,10 @@ class ILabManagerApp:
 
         self._form_canvas.configure(scrollregion=self._form_canvas.bbox("all"))
 
-        # ── Milestones tab ────────────────────────────────────────────────────
-        milestones: list = json.loads(rec.get("milestones_data") or "[]")
-        self._load_milestones(milestones, rec.get("request_id", ""))
+        # ── Track Work tab (workflow) + quick-actions bar ────────────────────
+        for key, var in self._wf_vars.items():
+            var.set(rec.get(key, "0") == "1")
+        self._update_quick_actions()
 
         # ── Training tab ──────────────────────────────────────────────────────
         self._training_core_var.set(rec.get("core_lab", ""))
@@ -604,58 +726,213 @@ class ILabManagerApp:
         self._class_status_lbl.config(
             text="✓ Class charge previously submitted." if taken else "")
 
-    def _load_milestones(self, milestones: list, request_id: str) -> None:
-        for w in self._ms_inner.winfo_children():
-            w.destroy()
-
-        if not milestones:
-            ttk.Label(self._ms_inner,
-                      text="No milestones found for this request.",
-                      foreground="#888").grid(row=0, column=0, padx=12, pady=12)
-            return
-
-        for col, (text, w) in enumerate([("Milestone", 260), ("Started", 100),
-                                          ("Completed", 100), ("Actions", 200)]):
-            ttk.Label(self._ms_inner, text=text, font=("", 9, "bold"),
-                      width=w//8).grid(row=0, column=col, padx=6, pady=(4,2), sticky="w")
-        ttk.Separator(self._ms_inner, orient="horizontal").grid(
-            row=1, column=0, columnspan=4, sticky="ew", padx=6)
-
-        for i, ms in enumerate(milestones, start=2):
-            ms_id    = ms.get("id")
-            name     = ms.get("name", "—")
-            started  = (ms.get("started_on")  or "")[:10] or "—"
-            finished = (ms.get("completed_on") or "")[:10] or "—"
-
-            ttk.Label(self._ms_inner, text=name, wraplength=250).grid(
-                row=i, column=0, padx=6, pady=3, sticky="w")
-            ttk.Label(self._ms_inner, text=started).grid(
-                row=i, column=1, padx=6, pady=3)
-            ttk.Label(self._ms_inner, text=finished).grid(
-                row=i, column=2, padx=6, pady=3)
-
-            btn_frame = ttk.Frame(self._ms_inner)
-            btn_frame.grid(row=i, column=3, padx=6, pady=2)
-            if ms.get("started_on") is None:
-                ttk.Button(
-                    btn_frame, text="Mark Started",
-                    command=lambda r=request_id, m=ms_id, ml=milestones:
-                        self._on_milestone_action(r, m, ml, "started"),
-                ).pack(side="left", padx=2)
-            if ms.get("completed_on") is None:
-                ttk.Button(
-                    btn_frame, text="Mark Complete",
-                    command=lambda r=request_id, m=ms_id, ml=milestones:
-                        self._on_milestone_action(r, m, ml, "completed"),
-                ).pack(side="left", padx=2)
-            elif finished != "—":
-                ttk.Label(btn_frame, text="✓ Done", foreground="#2E7D32").pack()
-
-        self._ms_canvas.configure(scrollregion=self._ms_canvas.bbox("all"))
 
     # =========================================================================
     # Event handlers
     # =========================================================================
+
+    # =========================================================================
+    # Quick-actions bar population
+    # =========================================================================
+
+    def _update_quick_actions(self) -> None:
+        """Rebuild the workflow-progress strip above the tabs."""
+        for w in self._qa_inner.winfo_children():
+            w.destroy()
+
+        if not self._current_rec:
+            ttk.Label(self._qa_inner, text="← select a request",
+                      foreground="#888").pack(side="left", padx=6, pady=4)
+            self._qa_canvas.configure(scrollregion=self._qa_canvas.bbox("all"))
+            return
+
+        rec = self._current_rec
+
+        _PRE = [
+            ("wf_emailed",            "Emailed"),
+            ("wf_class_scheduled",    "Class Sched"),
+            ("wf_not_required",       "No Class"),
+            ("class_taken",           "Class Taken"),
+            ("wf_training_scheduled", "Trng Sched"),
+        ]
+        _POST = [
+            ("wf_post_email",     "Post Email"),
+            ("wf_post_listserve", "Listserve"),
+            ("wf_post_approved",  "Approved"),
+            ("wf_post_confirmed", "Confirmed"),
+        ]
+
+        def _chip(label: str, done: bool) -> None:
+            fg = "#2E7D32" if done else "#9E9E9E"
+            pfx = "✓ " if done else "○ "
+            ttk.Label(self._qa_inner, text=pfx + label,
+                      foreground=fg, font=("", 8)).pack(
+                side="left", padx=3, pady=3)
+
+        ttk.Label(self._qa_inner, text="Pre:",
+                  font=("", 8, "bold")).pack(side="left", padx=(6, 2), pady=3)
+        for key, lbl in _PRE:
+            _chip(lbl, rec.get(key, "0") == "1")
+
+        ttk.Label(self._qa_inner, text="  |  Post:",
+                  font=("", 8, "bold")).pack(side="left", padx=(4, 2), pady=3)
+        for key, lbl in _POST:
+            _chip(lbl, rec.get(key, "0") == "1")
+
+        self._qa_canvas.configure(scrollregion=self._qa_canvas.bbox("all"))
+
+    # =========================================================================
+    # Inline cell editing
+    # =========================================================================
+
+    # Columns that open a dropdown on click (field → values list)
+    _EDITABLE_COLS: dict = {}   # populated in __init__ after config is imported
+
+    def _on_tree_click(self, event) -> None:
+        """Open an inline editor when clicking an editable cell in an already-selected row."""
+        region = self._tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        row_id = self._tree.identify_row(event.y)
+        if not row_id:
+            return
+        # Only edit on the row that is already selected (second click)
+        sel = self._tree.selection()
+        if not sel or sel[0] != row_id:
+            return
+        col_id  = self._tree.identify_column(event.x)
+        col_idx = int(col_id[1:]) - 1
+        cols    = self._tree["columns"]
+        if col_idx < 0 or col_idx >= len(cols):
+            return
+        col_name = cols[col_idx]
+
+        if col_name == "state":
+            self._show_cell_combo(
+                row_id, col_id, "state",
+                [
+                    "completed",            # most common action — top of list
+                    "processing",
+                    "proposed",
+                    "requested",
+                    "financials_approved",
+                    "needs_financial_reapproval",
+                    "cancelled",
+                ],
+                on_commit=self._on_push_state_inline,
+            )
+        elif col_name == "assigned_to":
+            self._show_cell_combo(row_id, col_id, "assigned_to",
+                                  [""] + TEAM_MEMBERS)
+        elif col_name == "core_lab":
+            self._show_cell_combo(row_id, col_id, "core_lab", [""] + CORE_OPTIONS)
+        elif col_name == "microscope":
+            self._show_cell_combo(row_id, col_id, "microscope", [""] + MICROSCOPES)
+        elif col_name == "training_day":
+            self._show_cell_combo(row_id, col_id, "training_day", [""] + TRAINING_DAYS)
+        elif col_name == "training_time":
+            self._show_cell_entry(row_id, col_id, "training_time")
+        elif col_name == "labels":
+            self._show_labels_popup(row_id, event.x_root, event.y_root)
+        elif col_name == "training_date":
+            self._on_training_date_pick()
+        elif col_name == "class_taken":
+            # Toggle directly without needing the detail panel checkbox
+            if self._current_rec and self._current_rec.get("request_id") == row_id:
+                new_state = self._current_rec.get("class_taken", "0") != "1"
+                self._class_taken_var.set(new_state)
+                self._on_class_taken_toggle()
+
+    def _show_cell_combo(self, row_id: str, col_id: str,
+                         field: str, values: list,
+                         on_commit=None) -> None:
+        """
+        Overlay a Combobox on a Treeview cell.
+        on_commit(row_id, value) is called instead of the default local-save
+        when provided (used for state pushes to iLab).
+        """
+        bbox = self._tree.bbox(row_id, col_id)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        current = self._tree.set(row_id, col_id)
+        var     = tk.StringVar(value=current)
+        combo   = ttk.Combobox(self._tree, textvariable=var,
+                               values=values, state="readonly", font=("", 9))
+        combo.place(x=x, y=y, width=max(w, 120), height=h + 2)
+        combo.focus_set()
+        combo.event_generate("<Down>")
+
+        def _commit(*_):
+            val = var.get()
+            combo.place_forget()
+            combo.destroy()
+            if on_commit:
+                on_commit(row_id, val)
+                return
+            rec = self._data.get_record(row_id)
+            if rec is None:
+                return
+            self._data.update_local_fields(row_id, **{field: val})
+            rec[field] = val
+            self._tree.set(row_id, col_id, val)
+            if field == "assigned_to":
+                self._assigned_var.set(val)
+            elif field == "core_lab":
+                self._training_core_var.set(val)
+            elif field == "microscope":
+                self._training_micro_var.set(val)
+            self._set_status(f"Updated {field} for request {row_id}.")
+
+        def _cancel(*_):
+            combo.place_forget()
+            combo.destroy()
+
+        combo.bind("<<ComboboxSelected>>", _commit)
+        combo.bind("<Escape>",             _cancel)
+        combo.bind("<FocusOut>",           _cancel)
+
+    def _show_labels_popup(self, row_id: str, x_root: int, y_root: int) -> None:
+        """Floating checkbox popup for multi-value Labels editing."""
+        rec = self._data.get_record(row_id)
+        if rec is None:
+            return
+        active = set(filter(None, (rec.get("labels") or "").split(",")))
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Labels")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        popup.geometry(f"+{x_root}+{y_root}")
+
+        frame = ttk.Frame(popup, padding=8)
+        frame.pack()
+        ttk.Label(frame, text="Labels", font=("", 9, "bold")).pack(anchor="w", pady=(0, 4))
+
+        chk_vars: dict[str, tk.BooleanVar] = {}
+        for lbl in LABELS:
+            v = tk.BooleanVar(value=lbl in active)
+            chk_vars[lbl] = v
+            ttk.Checkbutton(frame, text=lbl, variable=v).pack(anchor="w")
+
+        def _save():
+            selected = ",".join(l for l, v in chk_vars.items() if v.get())
+            self._data.update_local_fields(row_id, labels=selected)
+            rec["labels"] = selected
+            self._tree.set(row_id, "labels", selected)
+            # Sync the checkboxes in the Request Info tab
+            active_set = set(filter(None, selected.split(",")))
+            for lbl, var in self._label_vars.items():
+                var.set(lbl in active_set)
+            popup.destroy()
+            self._set_status(f"Labels updated for request {row_id}.")
+
+        btn = ttk.Frame(frame)
+        btn.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn, text="Save",   command=_save).pack(side="left", padx=(0, 4))
+        ttk.Button(btn, text="Cancel", command=popup.destroy).pack(side="left")
+        popup.bind("<Escape>", lambda e: popup.destroy())
+        popup.focus_set()
 
     def _on_row_select(self, _event=None) -> None:
         sel = self._tree.selection()
@@ -746,7 +1023,6 @@ class ILabManagerApp:
                 self._data.update_milestones(request_id, milestones)
                 if self._current_rec and self._current_rec.get("request_id") == request_id:
                     self._current_rec["milestones_data"] = json.dumps(milestones)
-                self.root.after(0, lambda: self._load_milestones(milestones, request_id))
                 self.root.after(0, lambda: self._set_status(
                     f"Milestone {milestone_id} marked {action}."))
             except ILabError as exc:
@@ -865,15 +1141,30 @@ class ILabManagerApp:
 
     def _on_training_date_selected(self, date_str: str) -> None:
         self._training_date_var.set(date_str)
-        # Auto-populate Training Day from the selected date
+        day_str = ""
         try:
             d = _date.fromisoformat(date_str)
-            # Map Python weekday (0=Mon…6=Sun) to TRAINING_DAYS list index
-            day_abbrs = TRAINING_DAYS
-            weekday   = d.weekday()          # 0=Mon, 6=Sun
-            if weekday < len(day_abbrs):
-                self._training_day_var.set(day_abbrs[weekday])
+            weekday = d.weekday()          # 0=Mon … 6=Sun
+            if weekday < len(TRAINING_DAYS):
+                day_str = TRAINING_DAYS[weekday]
+                self._training_day_var.set(day_str)
         except ValueError:
+            pass
+
+        if not self._current_rec:
+            return
+        req_id = self._current_rec["request_id"]
+        fields = {"training_date": date_str}
+        if day_str:
+            fields["training_day"] = day_str
+        self._data.update_local_fields(req_id, **fields)
+        self._current_rec.update(fields)
+        # Reflect immediately in the table
+        try:
+            self._tree.set(req_id, "training_date", date_str)
+            if day_str:
+                self._tree.set(req_id, "training_day", day_str)
+        except Exception:
             pass
 
     def _on_save_training(self) -> None:
@@ -1034,6 +1325,91 @@ class ILabManagerApp:
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
 
+    def _show_cell_entry(self, row_id: str, col_id: str, field: str) -> None:
+        """Overlay a plain Entry widget on a Treeview cell for free-text editing."""
+        bbox = self._tree.bbox(row_id, col_id)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        var   = tk.StringVar(value=self._tree.set(row_id, col_id))
+        entry = ttk.Entry(self._tree, textvariable=var, font=("", 9))
+        entry.place(x=x, y=y, width=max(w, 90), height=h + 2)
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def _commit(*_):
+            val = var.get().strip()
+            entry.place_forget()
+            entry.destroy()
+            rec = self._data.get_record(row_id)
+            if rec is None:
+                return
+            self._data.update_local_fields(row_id, **{field: val})
+            rec[field] = val
+            self._tree.set(row_id, col_id, val)
+            if field == "training_time":
+                self._training_time_var.set(val)
+
+        def _cancel(*_):
+            entry.place_forget()
+            entry.destroy()
+
+        entry.bind("<Return>",   _commit)
+        entry.bind("<Tab>",      _commit)
+        entry.bind("<Escape>",   _cancel)
+        entry.bind("<FocusOut>", _commit)
+
+    def _on_push_state_inline(self, row_id: str, new_state: str) -> None:
+        """Push a state change to iLab from a table-cell dropdown."""
+        core_id = self._get_core_id()
+        if not core_id:
+            return
+        # Optimistic local update so the table refreshes immediately
+        self._data.update_field(row_id, "state", new_state)
+        rec = self._data.get_record(row_id)
+        if rec:
+            rec["state"] = new_state
+        self._refresh_table()
+        try:
+            self._tree.selection_set(row_id)
+        except tk.TclError:
+            pass
+
+        def worker():
+            try:
+                client = self._get_client()
+                client.update_service_request(core_id, int(row_id), state=new_state)
+                self.root.after(0, lambda: self._set_status(
+                    f"State → {new_state} pushed to iLab for #{row_id}."))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: messagebox.showerror(
+                    "iLab Error", f"State updated locally but iLab push failed:\n{e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_user_permissions(self) -> None:
+        """Open a dialog linking to the iLab people/permissions page."""
+        url = "https://ucsf.ilab.agilent.com/sc/5226/center-for-advanced-light-microscopy?tab=people"
+        webbrowser.open(url)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("User Permissions")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="iLab user permissions page opened in your browser.",
+                  padding=(16, 12)).pack()
+        ttk.Label(dlg, text=url, foreground="#1565C0",
+                  cursor="hand2", padding=(16, 0)).pack()
+        ttk.Button(dlg, text="Done", command=dlg.destroy,
+                   width=10).pack(pady=12)
+
+        dlg.update_idletasks()
+        px = self.root.winfo_rootx() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        py = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, px)}+{max(0, py)}")
+
     def _on_open_preferences(self) -> None:
         PreferencesDialog(self.root)
 
@@ -1093,6 +1469,20 @@ class ILabManagerApp:
 
     def _set_last_sync(self, when: str) -> None:
         self._last_sync_var.set(f"Last synced: {when}")
+
+    def _restore_last_sync(self) -> None:
+        """On startup, show the most recent last_synced timestamp from the cache."""
+        records = self._data.all_records()
+        if not records:
+            return
+        latest = max((r.get("last_synced", "") for r in records), default="")
+        if not latest:
+            return
+        try:
+            when = datetime.fromisoformat(latest[:19].replace("T", " ")).strftime("%b %d  %I:%M %p")
+        except ValueError:
+            when = latest[:10]
+        self._set_last_sync(when)
 
 
 # =============================================================================

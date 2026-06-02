@@ -1,5 +1,5 @@
 """
-iLab Solutions API client for https://ucsf.ilab.agilent.com
+iLab Solutions API client for https://api.ilab.agilent.com
 
 Authentication: Bearer token in the Authorization header.
 Pass token= directly or set the ILAB_TOKEN environment variable.
@@ -11,7 +11,7 @@ import requests
 from typing import List, Optional, Union
 
 # Core IDs may be numeric (1234) or a slug ("CALM") depending on the iLab instance.
-CoreID = Union[int, str]
+CoreID = Union[5226, str]
 
 
 def _load_dotenv() -> None:

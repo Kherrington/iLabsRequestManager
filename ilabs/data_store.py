@@ -15,6 +15,43 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 
+def _detect_core(form_data: dict) -> str:
+    """
+    Detect core facility from form data.
+    Checks 'Which Facility do you need Training for?' first, then falls back
+    to a general CALM / CVRI text scan across all keys and values.
+    """
+    facility_keys = {
+        "which facility do you need training for",
+        "which facility do you need training for?",
+        "facility",
+        "which facility",
+        "core facility",
+        "core",
+    }
+    def _is_calm(v: str) -> bool:
+        return "CALM" in v or "NIC" in v   # NIC = old name for CALM
+
+    # Priority: check specific field whose answer is CALM/NIC or CVRI
+    for key, val in form_data.items():
+        if key.lower().strip().rstrip("?") in {k.rstrip("?") for k in facility_keys}:
+            v = str(val).upper()
+            if "CVRI" in v:
+                return "CVRI"
+            if _is_calm(v):
+                return "CALM"
+    # Fallback: full text scan
+    text = (
+        " ".join(str(v) for v in form_data.values()) + " " +
+        " ".join(form_data.keys())
+    ).upper()
+    if "CVRI" in text:
+        return "CVRI"
+    if _is_calm(text):
+        return "CALM"
+    return ""
+
+
 _FIXED_COLS = [
     "request_id", "name", "state", "created_at",
     "start_on", "end_on", "completed_on",
@@ -27,6 +64,11 @@ _LOCAL_COLS = [
     "core_lab", "microscope",
     "training_date", "training_time", "training_day",
     "class_taken",
+    # Workflow progress checkboxes (pre- and post-training)
+    "wf_emailed", "wf_class_scheduled", "wf_not_required",
+    "wf_training_scheduled",
+    "wf_post_email", "wf_post_listserve",
+    "wf_post_approved", "wf_post_confirmed",
 ]
 _BLOB_COLS  = ["form_data", "milestones_data"]
 
@@ -107,42 +149,81 @@ class DataStore:
             else:
                 form_data = json.loads(existing.get("form_data") or "{}")
 
-            # ── Milestones ────────────────────────────────────────────────────
-            milestones: list = []
-            try:
-                milestones = client.list_milestones(core_id, int(req_id))
-            except Exception:
-                milestones = json.loads(existing.get("milestones_data") or "[]")
+            owner   = req.get("owner") or {}
+            lab     = req.get("lab")   or {}
+            pi_list = lab.get("principal_investigators") or []
+            pi      = pi_list[0] if pi_list else {}
 
-            owner = req.get("owner") or {}
-            pi    = req.get("principal_investigator") or {}
+            # ── PI / Lab name: API lab name first, then PI name, then form data
+            pi_name_val = lab.get("name", "") or pi.get("name", "")
+            if not pi_name_val:
+                pi_keys = {"pi name", "pi", "principal investigator",
+                           "lab pi", "pi/lab", "lab/pi", "lab name"}
+                for fk, fv in form_data.items():
+                    if fk.lower().strip() in pi_keys:
+                        pi_name_val = str(fv)
+                        break
+
+            # ── Core: check "Which Facility" form field ───────────────────────
+            existing_core = existing.get("core_lab", "")
+            if not existing_core:
+                existing_core = _detect_core(form_data)
+
+            existing_assigned = existing.get("assigned_to", "")
 
             self.records[req_id] = {
-                # iLab fields (always refreshed)
-                "request_id":  req_id,
-                "name":        req.get("name", ""),
-                "state":       req.get("state", ""),
-                "created_at":  req.get("created_at", ""),
-                "start_on":    req.get("start_on", ""),
-                "end_on":      req.get("end_on", ""),
-                "completed_on": req.get("completed_on", ""),
-                "owner_name":  owner.get("name", ""),
-                "owner_email": owner.get("email", ""),
-                "pi_name":     pi.get("name", ""),
-                "pi_email":    pi.get("email", ""),
+                # ── iLab fields (always refreshed from API) ───────────────────
+                "request_id":   req_id,
+                "name":         req.get("name", ""),
+                "state":        req.get("state", ""),
+                # submitted_at is the correct field; fall back to created_at for
+                # any older cached records that used the wrong key
+                "created_at":   req.get("submitted_at") or req.get("created_at") or "",
+                "start_on":     req.get("start_on") or "",
+                "end_on":       req.get("end_on") or "",
+                "completed_on": req.get("completed_on") or "",
+                "owner_name":   owner.get("name", ""),
+                "owner_email":  owner.get("email", ""),
+                "pi_name":      pi_name_val,
+                "pi_email":     pi.get("email", ""),
                 "service_name": req.get("service_name", ""),
-                "last_synced": datetime.now().isoformat(timespec="seconds"),
-                # Local fields (preserved from previous edits)
-                "assigned_to": existing.get("assigned_to", ""),
-                "labels":      existing.get("labels", ""),
-                "local_notes": existing.get("local_notes", ""),
-                # Blobs
+                "last_synced":  datetime.now().isoformat(timespec="seconds"),
+                # ── Local fields (never overwritten after first fill) ──────────
+                "assigned_to":    existing_assigned,
+                "labels":         existing.get("labels", ""),
+                "local_notes":    existing.get("local_notes", ""),
+                # ── Training fields (always preserved) ────────────────────────
+                "core_lab":       existing_core,
+                "microscope":     existing.get("microscope", ""),
+                "training_date":  existing.get("training_date", ""),
+                "training_time":  existing.get("training_time", ""),
+                "training_day":   existing.get("training_day", ""),
+                "class_taken":    existing.get("class_taken", "0"),
+                # ── Workflow progress (always preserved) ──────────────────────
+                "wf_emailed":           existing.get("wf_emailed", "0"),
+                "wf_class_scheduled":   existing.get("wf_class_scheduled", "0"),
+                "wf_not_required":      existing.get("wf_not_required", "0"),
+                "wf_training_scheduled":existing.get("wf_training_scheduled", "0"),
+                "wf_post_email":        existing.get("wf_post_email", "0"),
+                "wf_post_listserve":    existing.get("wf_post_listserve", "0"),
+                "wf_post_approved":     existing.get("wf_post_approved", "0"),
+                "wf_post_confirmed":    existing.get("wf_post_confirmed", "0"),
+                # ── Blobs ─────────────────────────────────────────────────────
                 "form_data":       json.dumps(form_data, ensure_ascii=False),
-                "milestones_data": json.dumps(milestones, ensure_ascii=False),
+                "milestones_data": existing.get("milestones_data", "[]"),
             }
 
+        # ── Remove records no longer active in iLab ───────────────────────────
+        fetched_ids = {str(req.get("id")) for req in requests_list}
+        stale = [rid for rid in list(self.records) if rid not in fetched_ids]
+        for rid in stale:
+            del self.records[rid]
+        if stale:
+            _progress(f"Removed {len(stale)} inactive request(s) from cache.")
+
         self.save()
-        _progress(f"Sync complete — {total} request(s) cached.")
+        _progress(f"Sync complete — {total} active request(s), "
+                  f"{len(stale)} removed.")
         return total
 
     # ── CRUD helpers ──────────────────────────────────────────────────────────
