@@ -1,5 +1,0 @@
-.env
-*.csv
-prefs.json
-__pycache__/
-*.pyc
