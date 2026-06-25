@@ -22,7 +22,7 @@ ILAB_BASE_URL = "https://api.ilabsolutions.com"
 CORE_ID = 5226
 
 # ── Local data file ───────────────────────────────────────────────────────────
-DATA_FILE = "requests_cache.csv"
+DATA_FILE = "ilab_requests_cache.csv"
 
 # ── Team members shown in the "Assigned To" dropdown ─────────────────────────
 TEAM_MEMBERS = [
@@ -36,9 +36,7 @@ TEAM_MEMBERS = [
 LABELS = [
     "Urgent",
     "Pending Sample",
-    "Offered Training",
-    "Class Taken",
-    "Needs to Take Class",
+    "Emailed and Waiting",
     "Refresher",
     "Switching Microscopes",
     "Follow-up Needed",

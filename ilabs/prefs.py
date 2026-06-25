@@ -15,8 +15,12 @@ from pathlib import Path
 _PREFS_FILE = Path(__file__).parent / "prefs.json"
 
 _DEFAULTS: dict = {
+    "dark_mode":        "0",
+    "data_file":        "",   # path to ilab_requests_cache.csv; blank = app directory
     "calm_xlsx":        "",
+    "calm_sheet":       "",   # worksheet name to append to; blank = first sheet
     "cvri_xlsx":        "",
+    "cvri_sheet":       "",
     "class_service_id": "",
     "class_price_id":   "",
     "class_quantity":   "2",

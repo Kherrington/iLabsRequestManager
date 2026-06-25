@@ -65,10 +65,13 @@ _LOCAL_COLS = [
     "training_date", "training_time", "training_day",
     "class_taken",
     # Workflow progress checkboxes (pre- and post-training)
+    "wf_laser_safety",
     "wf_emailed", "wf_class_scheduled", "wf_not_required",
     "wf_training_scheduled",
     "wf_post_email", "wf_post_listserve",
     "wf_post_approved", "wf_post_confirmed",
+    "schedule_exported",   # "1" once appended to the xlsx training schedule
+    "local_only",          # "1" for manually-added records that have no iLab ID
 ]
 _BLOB_COLS  = ["form_data", "milestones_data"]
 
@@ -76,7 +79,7 @@ ALL_COLS = _FIXED_COLS + _LOCAL_COLS + _BLOB_COLS
 
 
 class DataStore:
-    def __init__(self, filepath: str = "requests_cache.csv"):
+    def __init__(self, filepath: str = "ilab_requests_cache.csv"):
         self.filepath = Path(filepath)
         self.records: Dict[str, dict] = {}
         self._load()
@@ -89,6 +92,28 @@ class DataStore:
         with open(self.filepath, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 self.records[row["request_id"]] = row
+
+    def reload(self) -> None:
+        """Re-read the CSV from disk, merging remote changes while preserving
+        any in-memory local fields that are newer than what's on disk."""
+        if not self.filepath.exists():
+            return
+        disk_records: Dict[str, dict] = {}
+        with open(self.filepath, newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                disk_records[row["request_id"]] = row
+        # Disk wins for iLab fields; in-memory wins for local fields
+        for req_id, disk_rec in disk_records.items():
+            mem_rec = self.records.get(req_id, {})
+            merged = {**disk_rec}
+            for col in _LOCAL_COLS:
+                if col in mem_rec:
+                    merged[col] = mem_rec[col]
+            self.records[req_id] = merged
+        # Pick up brand-new records that only exist on disk
+        for req_id, disk_rec in disk_records.items():
+            if req_id not in self.records:
+                self.records[req_id] = disk_rec
 
     def save(self) -> None:
         with open(self.filepath, "w", newline="", encoding="utf-8") as fh:
@@ -200,6 +225,7 @@ class DataStore:
                 "training_day":   existing.get("training_day", ""),
                 "class_taken":    existing.get("class_taken", "0"),
                 # ── Workflow progress (always preserved) ──────────────────────
+                "wf_laser_safety":      existing.get("wf_laser_safety", "0"),
                 "wf_emailed":           existing.get("wf_emailed", "0"),
                 "wf_class_scheduled":   existing.get("wf_class_scheduled", "0"),
                 "wf_not_required":      existing.get("wf_not_required", "0"),
@@ -208,6 +234,7 @@ class DataStore:
                 "wf_post_listserve":    existing.get("wf_post_listserve", "0"),
                 "wf_post_approved":     existing.get("wf_post_approved", "0"),
                 "wf_post_confirmed":    existing.get("wf_post_confirmed", "0"),
+                "schedule_exported":    existing.get("schedule_exported", "0"),
                 # ── Blobs ─────────────────────────────────────────────────────
                 "form_data":       json.dumps(form_data, ensure_ascii=False),
                 "milestones_data": existing.get("milestones_data", "[]"),
@@ -215,13 +242,17 @@ class DataStore:
 
         # ── Remove records no longer active in iLab ───────────────────────────
         fetched_ids = {str(req.get("id")) for req in requests_list}
-        stale = [rid for rid in list(self.records) if rid not in fetched_ids]
+        stale = [rid for rid in list(self.records)
+                 if rid not in fetched_ids
+                 and self.records[rid].get("local_only") != "1"]
         for rid in stale:
             del self.records[rid]
         if stale:
             _progress(f"Removed {len(stale)} inactive request(s) from cache.")
 
         self.save()
+        distinct_states = sorted({self.records[rid].get("state", "") for rid in fetched_ids if rid in self.records})
+        print(f"[Sync] states returned by iLab: {distinct_states}")
         _progress(f"Sync complete — {total} active request(s), "
                   f"{len(stale)} removed.")
         return total
@@ -250,6 +281,36 @@ class DataStore:
         if rec is not None:
             rec["milestones_data"] = json.dumps(milestones, ensure_ascii=False)
             self.save()
+
+    def add_manual_record(self, fields: dict) -> str:
+        """
+        Create a local-only record (not linked to any iLab request).
+        Returns the generated request_id (LOCAL-YYYYMMDDHHMMSS).
+        """
+        req_id = "LOCAL-" + datetime.now().strftime("%Y%m%d%H%M%S")
+        # Ensure uniqueness if multiple are created within the same second
+        suffix = 0
+        while req_id + (f"-{suffix}" if suffix else "") in self.records:
+            suffix += 1
+        if suffix:
+            req_id = f"{req_id}-{suffix}"
+
+        rec: dict = {col: "" for col in ALL_COLS}
+        rec.update({
+            "request_id":  req_id,
+            "state":       fields.get("state", "requested"),
+            "created_at":  datetime.now().isoformat(timespec="seconds"),
+            "last_synced": "manual",
+            "local_only":  "1",
+            "form_data":   "{}",
+            "milestones_data": "[]",
+        })
+        for key, val in fields.items():
+            if key in ALL_COLS:
+                rec[key] = val
+        self.records[req_id] = rec
+        self.save()
+        return req_id
 
     def clear_all(self) -> None:
         """Remove every cached record and overwrite the CSV with an empty store."""

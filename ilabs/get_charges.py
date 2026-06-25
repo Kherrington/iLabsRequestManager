@@ -23,6 +23,7 @@ import sys
 
 from ilabs_client import ILabClient
 
+core_id = 5226  # CALM
 
 FIELDS = [
     "request_id",
@@ -41,7 +42,7 @@ FIELDS = [
 
 def main():
     parser = argparse.ArgumentParser(description="Export iLab charges to CSV")
-    parser.add_argument("--core-id", type=int, required=True, help="iLab core ID")
+    parser.add_argument("--core-id", type=int, default=core_id, help="iLab core ID (default: %(default)s)")
     parser.add_argument("--request-id", type=int, help="Pull charges from a single request only")
     parser.add_argument("--states", help="Filter requests by state (comma-separated)")
     parser.add_argument("--from-date", metavar="YYYY-MM-DD")

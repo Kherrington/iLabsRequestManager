@@ -41,6 +41,30 @@ STATE_COLORS = {
 }
 
 
+STATE_COLORS_DARK = {
+    "proposed":                    "#3d3500",
+    "requested":                   "#1a1e40",
+    "draft":                       "#303030",
+    "processing":                  "#0d2a45",
+    "financials_approved":         "#0a2e30",
+    "needs_financial_reapproval":  "#3d2200",
+    "completed":                   "#0a2d0a",
+    "cancelled":                   "#2a2a2a",
+    "core_disagreement":           "#3d0f0f",
+    "disagreement":                "#3d0f0f",
+}
+
+
+def _lighten_hex(hex_color: str, factor: float = 0.4) -> str:
+    """Return hex_color blended factor% toward white."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    r = round(r + (255 - r) * factor)
+    g = round(g + (255 - g) * factor)
+    b = round(b + (255 - b) * factor)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 def _detect_core_from_form(form_data: dict) -> str:
     """Scan form-data keys and values for 'CALM' or 'CVRI'."""
     text = (
@@ -63,7 +87,9 @@ class ILabManagerApp:
         self.root.geometry("1420x820")
         self.root.minsize(900, 600)
 
-        self._data = DataStore(DATA_FILE)
+        _p = _prefs.get_prefs()
+        _data_path = str(_p.get("data_file", "") or "").strip() or DATA_FILE
+        self._data = DataStore(_data_path)
         self._client: ILabClient | None = None
         self._current_rec: dict | None = None
         self._sort_col = "created_at"
@@ -72,9 +98,18 @@ class ILabManagerApp:
         # Shared var used by both the Track Work and Training tabs
         self._class_taken_var = tk.BooleanVar()
 
+        self._dark_mode = False
+
         self._build_ui()
+        self._data.reload()          # pick up any changes written by other machines
         self._refresh_table()
         self._restore_last_sync()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Apply saved theme after UI is fully built
+        _dark_pref = str(_p.get("dark_mode", "0")).strip() == "1"
+        if _dark_pref:
+            self._apply_theme(dark=True)
 
     # =========================================================================
     # UI construction
@@ -107,8 +142,12 @@ class ILabManagerApp:
         ttk.Button(bar, text="Clear All Requests",      command=self._on_clear_all).pack(side="left", padx=2)
         ttk.Button(bar, text="Import iLab Export CSV…", command=self._on_import).pack(side="left", padx=2)
         ttk.Button(bar, text="Export to CSV…",          command=self._on_export).pack(side="left", padx=2)
+        ttk.Button(bar, text="＋ New Entry",             command=self._on_add_manual_entry).pack(side="left", padx=2)
         ttk.Button(bar, text="👥 User Permissions",      command=self._on_user_permissions).pack(side="right", padx=2)
         ttk.Button(bar, text="⚙  Preferences",          command=self._on_open_preferences).pack(side="right", padx=(0, 4))
+        self._dark_btn = ttk.Button(bar, text="🌙 Dark",  command=self._toggle_dark_mode)
+        self._dark_btn.pack(side="right", padx=2)
+        ttk.Button(bar, text="⟳  Sync NON-iLab", command=self._on_sync_cache).pack(side="right", padx=2)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
 
@@ -190,6 +229,8 @@ class ILabManagerApp:
 
         for state, color in STATE_COLORS.items():
             self._tree.tag_configure(state, background=color)
+            self._tree.tag_configure(state + "_alt",
+                                     background=_lighten_hex(color))
 
         vsb = ttk.Scrollbar(frame, orient="vertical",   command=self._tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=self._tree.xview)
@@ -376,6 +417,7 @@ class ILabManagerApp:
 
         # ── Workflow BooleanVars ───────────────────────────────────────────────
         self._wf_vars = {
+            "wf_laser_safety":       tk.BooleanVar(),
             "wf_emailed":            tk.BooleanVar(),
             "wf_class_scheduled":    tk.BooleanVar(),
             "wf_not_required":       tk.BooleanVar(),
@@ -395,6 +437,15 @@ class ILabManagerApp:
             self._data.update_local_fields(req_id, **fields)
             self._current_rec.update(fields)
             self._update_quick_actions()
+            # If "No" (wf_not_required) is checked, disable Class Taken; re-enable if unchecked
+            already_submitted = self._current_rec.get("class_taken") == "1"
+            if not already_submitted:
+                no_class = self._wf_vars["wf_not_required"].get()
+                chk_state = "disabled" if no_class else "normal"
+                for chk in (getattr(self, "_class_taken_chk", None),
+                            getattr(self, "_class_taken_chk_track", None)):
+                    if chk:
+                        chk.config(state=chk_state)
 
         def _chk(parent, key, label, url=None):
             """Build one checkbox row, with an optional hyperlink on the label."""
@@ -418,16 +469,29 @@ class ILabManagerApp:
         pre = ttk.LabelFrame(cols, text="Pre-Training", padding=10)
         pre.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
+        _chk(pre, "wf_laser_safety",        "Laser Safety")
         _chk(pre, "wf_emailed",            "Emailed User")
-        _chk(pre, "wf_class_scheduled",    "Class Scheduled")
-        _chk(pre, "wf_not_required",       "Not Required (class)")
+        # Class? — Yes / No on one row
+        class_row = ttk.Frame(pre)
+        class_row.pack(anchor="w", pady=3)
+        ttk.Label(class_row, text="Class?").pack(side="left", padx=(0, 6))
+        ttk.Checkbutton(class_row, variable=self._wf_vars["wf_class_scheduled"],
+                        command=_save_wf).pack(side="left")
+        ttk.Label(class_row, text="Yes").pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(class_row, variable=self._wf_vars["wf_not_required"],
+                        command=_save_wf).pack(side="left")
+        ttk.Label(class_row, text="No").pack(side="left")
 
-        # Class Taken row — shares the Training tab's class_taken var
+        # if yes → Class Taken (indented)
         ct_row = ttk.Frame(pre)
         ct_row.pack(anchor="w", pady=3)
-        ttk.Checkbutton(ct_row, variable=self._class_taken_var,
-                        command=self._on_class_taken_toggle).pack(side="left")
-        ttk.Label(ct_row, text="Class Taken").pack(side="left")
+        ttk.Label(ct_row, text="    if yes:").pack(side="left", padx=(0, 4))
+        self._class_taken_chk_track = ttk.Checkbutton(
+            ct_row, variable=self._class_taken_var,
+            command=self._on_class_taken_toggle)
+        self._class_taken_chk_track.pack(side="left")
+        self._class_taken_lbl_track = ttk.Label(ct_row, text="Class Taken")
+        self._class_taken_lbl_track.pack(side="left")
 
         _chk(pre, "wf_training_scheduled", "Training Scheduled")
 
@@ -465,17 +529,27 @@ class ILabManagerApp:
         left.pack(side="left", fill="both", expand=True, padx=(0, 18))
         right.pack(side="left", fill="both", expand=True)
 
-        # ── Left: fields ──────────────────────────────────────────────────────
+        # ── Left: Export button at the top ───────────────────────────────────
+        top_row = ttk.Frame(left)
+        top_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Button(top_row, text="Export to Records →",
+                   command=self._on_export_to_schedule).pack(side="left", padx=(0, 10))
+        self._exported_lbl = ttk.Label(top_row, text="", foreground="#2E7D32")
+        self._exported_lbl.pack(side="left")
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
         ttk.Label(left, text="Training Details", font=("", 10, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            row=2, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
         LW = 15   # label column width
 
-        # Core Lab
+        # Core Lab  (row offset +3 to sit below the new top export strip)
         ttk.Label(left, text="Core Lab:", anchor="e", width=LW).grid(
-            row=1, column=0, sticky="e", padx=4, pady=3)
+            row=3, column=0, sticky="e", padx=4, pady=3)
         core_row = ttk.Frame(left)
-        core_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+        core_row.grid(row=3, column=1, columnspan=2, sticky="w", padx=4, pady=3)
         ttk.Combobox(core_row, textvariable=self._training_core_var,
                      values=CORE_OPTIONS, width=8, state="readonly").pack(side="left")
         ttk.Button(core_row, text="Auto-detect",
@@ -483,58 +557,56 @@ class ILabManagerApp:
 
         # Microscope
         ttk.Label(left, text="Microscope:", anchor="e", width=LW).grid(
-            row=2, column=0, sticky="e", padx=4, pady=3)
+            row=4, column=0, sticky="e", padx=4, pady=3)
         ttk.Combobox(left, textvariable=self._training_micro_var,
                      values=MICROSCOPES, width=20).grid(
-            row=2, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+            row=4, column=1, columnspan=2, sticky="w", padx=4, pady=3)
 
         # Training Date
         ttk.Label(left, text="Training Date:", anchor="e", width=LW).grid(
-            row=3, column=0, sticky="e", padx=4, pady=3)
+            row=5, column=0, sticky="e", padx=4, pady=3)
         date_row = ttk.Frame(left)
-        date_row.grid(row=3, column=1, columnspan=2, sticky="w", padx=4, pady=3)
+        date_row.grid(row=5, column=1, columnspan=2, sticky="w", padx=4, pady=3)
         ttk.Entry(date_row, textvariable=self._training_date_var, width=13).pack(side="left")
         ttk.Button(date_row, text="📅", width=3,
                    command=self._on_training_date_pick).pack(side="left", padx=(4, 0))
 
         # Training Day
         ttk.Label(left, text="Training Day:", anchor="e", width=LW).grid(
-            row=4, column=0, sticky="e", padx=4, pady=3)
+            row=6, column=0, sticky="e", padx=4, pady=3)
         ttk.Combobox(left, textvariable=self._training_day_var,
                      values=TRAINING_DAYS, width=10, state="readonly").grid(
-            row=4, column=1, sticky="w", padx=4, pady=3)
+            row=6, column=1, sticky="w", padx=4, pady=3)
 
         # Training Time
         ttk.Label(left, text="Training Time:", anchor="e", width=LW).grid(
-            row=5, column=0, sticky="e", padx=4, pady=3)
+            row=7, column=0, sticky="e", padx=4, pady=3)
         ttk.Entry(left, textvariable=self._training_time_var, width=14).grid(
-            row=5, column=1, sticky="w", padx=4, pady=3)
+            row=7, column=1, sticky="w", padx=4, pady=3)
 
         ttk.Separator(left, orient="horizontal").grid(
-            row=6, column=0, columnspan=3, sticky="ew", pady=8)
+            row=8, column=0, columnspan=3, sticky="ew", pady=8)
 
         # Class Taken
-        ttk.Checkbutton(
+        self._class_taken_chk = ttk.Checkbutton(
             left,
             text="Class Taken  (adds 2 × Class charge, $200 total, to iLab)",
             variable=self._class_taken_var,
             command=self._on_class_taken_toggle,
-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=4)
+        )
+        self._class_taken_chk.grid(row=9, column=0, columnspan=3, sticky="w", padx=4)
         self._class_status_lbl = ttk.Label(
             left, text="", foreground="#555", wraplength=340)
         self._class_status_lbl.grid(
-            row=8, column=0, columnspan=3, sticky="w", padx=24, pady=(0, 4))
+            row=10, column=0, columnspan=3, sticky="w", padx=24, pady=(0, 4))
 
         ttk.Separator(left, orient="horizontal").grid(
-            row=9, column=0, columnspan=3, sticky="ew", pady=6)
+            row=11, column=0, columnspan=3, sticky="ew", pady=6)
 
-        # Buttons
-        btn_row = ttk.Frame(left)
-        btn_row.grid(row=10, column=0, columnspan=3, sticky="w", padx=4)
-        ttk.Button(btn_row, text="Save Training Info",
-                   command=self._on_save_training).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text="Export to Schedule →",
-                   command=self._on_export_to_schedule).pack(side="left")
+        # Save button at bottom
+        ttk.Button(left, text="Save Training Info",
+                   command=self._on_save_training).grid(
+            row=12, column=0, columnspan=3, sticky="w", padx=4)
 
         # ── Right: guidance ───────────────────────────────────────────────────
         ttk.Label(right, text="How to use", font=("", 10, "bold")).pack(
@@ -549,7 +621,7 @@ class ILabManagerApp:
             "   click any day to fill the field.  Training Day\n"
             "   is set automatically from the chosen date.\n\n"
             "4. Training Time — type freely (e.g. 10:00 AM).\n\n"
-            "5. Save Training Info, then Export to Schedule →\n"
+            "5. Save Training Info, then Export to Records →\n"
             "   to append a row to the correct xlsx file.\n"
             "   Set xlsx paths in ⚙ Preferences.\n\n"
             "6. Class Taken — tick when the researcher has\n"
@@ -609,7 +681,7 @@ class ILabManagerApp:
 
         # ── Repopulate treeview ───────────────────────────────────────────────
         self._tree.delete(*self._tree.get_children())
-        for rec in records:
+        for _row_idx, rec in enumerate(records):
             state = rec.get("state", "")
             raw = (rec.get("created_at") or "")
             # Strip milliseconds and timezone so fromisoformat works on all
@@ -638,7 +710,7 @@ class ILabManagerApp:
                     rec.get("training_time", ""),
                     "☑" if rec.get("class_taken") == "1" else "☐",
                 ),
-                tags=(state,),
+                tags=(state + ("_alt" if _row_idx % 2 else ""),),
             )
 
         self._row_count_var.set(f"{len(records)} request(s)")
@@ -698,7 +770,7 @@ class ILabManagerApp:
                 row=1, column=0, columnspan=2, sticky="ew", padx=6)
             for i, (fname, fval) in enumerate(form_data.items(), start=2):
                 ttk.Label(self._form_inner, text=fname, anchor="nw",
-                          wraplength=260, foreground="#333").grid(
+                          wraplength=260).grid(
                     row=i, column=0, padx=6, pady=2, sticky="nw")
                 ttk.Label(self._form_inner, text=str(fval), anchor="nw",
                           wraplength=400).grid(
@@ -706,7 +778,8 @@ class ILabManagerApp:
         else:
             ttk.Label(self._form_inner,
                       text="No form data loaded.\nSync from iLab to fetch form fields.",
-                      foreground="#888").grid(row=0, column=0, padx=12, pady=12)
+                      foreground=ttk.Style().lookup("TLabel", "foreground") or "#888",
+                      ).grid(row=0, column=0, padx=12, pady=12)
 
         self._form_canvas.configure(scrollregion=self._form_canvas.bbox("all"))
 
@@ -723,13 +796,38 @@ class ILabManagerApp:
         self._training_time_var.set(rec.get("training_time", ""))
         taken = rec.get("class_taken", "0") == "1"
         self._class_taken_var.set(taken)
-        self._class_status_lbl.config(
-            text="✓ Class charge previously submitted." if taken else "")
+        self._update_class_taken_ui(taken)
+        if not taken and rec.get("wf_not_required", "0") == "1":
+            for chk in (getattr(self, "_class_taken_chk", None),
+                        getattr(self, "_class_taken_chk_track", None)):
+                if chk:
+                    chk.config(state="disabled")
+        exported = rec.get("schedule_exported", "0") == "1"
+        self._exported_lbl.config(
+            text="✓ Exported to schedule" if exported else "Not yet exported")
 
 
     # =========================================================================
     # Event handlers
     # =========================================================================
+
+    def _update_class_taken_ui(self, submitted: bool) -> None:
+        """Grey out / re-enable both Class Taken checkboxes based on submission state."""
+        chk_state = "disabled" if submitted else "normal"
+        for chk in (getattr(self, "_class_taken_chk", None),
+                    getattr(self, "_class_taken_chk_track", None)):
+            if chk:
+                chk.config(state=chk_state)
+        if hasattr(self, "_class_taken_lbl_track"):
+            self._class_taken_lbl_track.config(
+                text="Class Taken — charge submitted" if submitted else "Class Taken",
+                foreground="#9E9E9E" if submitted else "",
+            )
+        if hasattr(self, "_class_status_lbl"):
+            self._class_status_lbl.config(
+                text="✓ Charge submitted to iLab — cannot be re-submitted." if submitted else "",
+                foreground="#9E9E9E" if submitted else "#555",
+            )
 
     # =========================================================================
     # Quick-actions bar population
@@ -749,6 +847,7 @@ class ILabManagerApp:
         rec = self._current_rec
 
         _PRE = [
+            ("wf_laser_safety",       "Laser Safety"),
             ("wf_emailed",            "Emailed"),
             ("wf_class_scheduled",    "Class Sched"),
             ("wf_not_required",       "No Class"),
@@ -839,6 +938,8 @@ class ILabManagerApp:
         elif col_name == "class_taken":
             # Toggle directly without needing the detail panel checkbox
             if self._current_rec and self._current_rec.get("request_id") == row_id:
+                if self._current_rec.get("class_taken", "0") == "1":
+                    return  # charge already submitted — block re-click
                 new_state = self._current_rec.get("class_taken", "0") != "1"
                 self._class_taken_var.set(new_state)
                 self._on_class_taken_toggle()
@@ -976,6 +1077,23 @@ class ILabManagerApp:
             messagebox.showwarning("No State Selected",
                                    "Choose a state from the dropdown first.")
             return
+
+        # Local-only records: update locally, skip iLab API entirely
+        if self._current_rec.get("local_only") == "1":
+            if not messagebox.askyesno(
+                    "Confirm",
+                    f"Set state to '{new_state}' for local entry {req_id}?\n"
+                    "(This entry is not linked to iLab.)"):
+                return
+            self._data.update_field(req_id, "state", new_state)
+            self._current_rec["state"] = new_state
+            self._info_vars["state"].set(new_state)
+            self._refresh_table()
+            self._set_status(f"Status → '{new_state}' (local only).")
+            if new_state == "completed":
+                self.root.after(100, lambda: self._auto_export_on_complete(req_id))
+            return
+
         core_id = self._get_core_id()
         if core_id is None:
             return
@@ -993,10 +1111,14 @@ class ILabManagerApp:
                 self.root.after(0, lambda: self._info_vars["state"].set(new_state))
                 self.root.after(0, self._refresh_table)
                 self.root.after(0, lambda: self._set_status(
-                    f"State updated to '{new_state}' for request {req_id}."))
+                    f"Status → '{new_state}' pushed to iLab for request {req_id}."))
+                if new_state == "completed":
+                    self.root.after(100, lambda: self._auto_export_on_complete(req_id))
             except ILabError as exc:
+                print(f"[iLab API Error] push state={new_state} req={req_id}: {exc}")
                 self.root.after(0, lambda e=exc: messagebox.showerror("iLab API Error", str(e)))
             except Exception as exc:
+                print(f"[Error] push state={new_state} req={req_id}: {exc}")
                 self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1031,6 +1153,17 @@ class ILabManagerApp:
                 self.root.after(0, lambda e=exc: messagebox.showerror("Error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_sync_cache(self) -> None:
+        """Reload the shared CSV from disk to pick up changes from other machines."""
+        self._data.reload()
+        self._refresh_table()
+        self._set_status("Cache reloaded from disk.")
+
+    def _on_close(self) -> None:
+        """Save current state to the shared CSV before exiting."""
+        self._data.save()
+        self.root.destroy()
 
     def _on_sync(self) -> None:
         core_id = self._get_core_id()
@@ -1086,6 +1219,61 @@ class ILabManagerApp:
             self._set_status(f"Exported to {path}")
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
+
+    def _on_add_manual_entry(self) -> None:
+        """Open a dialog to create a local-only training record."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New Manual Entry")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        fields_def = [
+            ("Requester Name",  "owner_name",    "entry",   None),
+            ("PI / Lab",        "pi_name",        "entry",   None),
+            ("Service",         "service_name",   "entry",   None),
+            ("Assigned To",     "assigned_to",    "combo",   [""] + TEAM_MEMBERS),
+            ("Core Lab",        "core_lab",       "combo",   [""] + CORE_OPTIONS),
+            ("Microscope",      "microscope",     "combo",   [""] + MICROSCOPES),
+            ("Training Date",   "training_date",  "entry",   None),
+            ("Training Day",    "training_day",   "combo",   [""] + TRAINING_DAYS),
+            ("Training Time",   "training_time",  "entry",   None),
+            ("Notes",           "local_notes",    "entry",   None),
+        ]
+
+        vars_: dict = {}
+        for i, (label, key, widget_type, options) in enumerate(fields_def):
+            ttk.Label(frame, text=label + ":").grid(row=i, column=0, sticky="e", padx=4, pady=3)
+            var = tk.StringVar()
+            vars_[key] = var
+            if widget_type == "combo":
+                w = ttk.Combobox(frame, textvariable=var, values=options,
+                                 width=28, state="readonly")
+            else:
+                w = ttk.Entry(frame, textvariable=var, width=30)
+            w.grid(row=i, column=1, sticky="w", padx=4, pady=3)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.grid(row=len(fields_def), column=0, columnspan=2, pady=(12, 0))
+
+        def _save():
+            rec_fields = {k: v.get().strip() for k, v in vars_.items()}
+            req_id = self._data.add_manual_record(rec_fields)
+            self._refresh_table()
+            # Select the new row
+            try:
+                self._tree.selection_set(req_id)
+                self._tree.see(req_id)
+            except tk.TclError:
+                pass
+            self._set_status(f"Manual entry {req_id} created.")
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Save", command=_save).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
 
     def _on_import(self) -> None:
         """Import a CSV exported from the iLab web UI (View All Requests → Export)."""
@@ -1267,8 +1455,10 @@ class ILabManagerApp:
 
                 self._data.update_local_fields(req_id, class_taken="1")
                 self._current_rec["class_taken"] = "1"
+                self.root.after(0, lambda: self._update_class_taken_ui(True))
                 self.root.after(0, lambda: self._class_status_lbl.config(
-                    text=f"✓ Class charge submitted to iLab ({qty} units)."))
+                    text=f"✓ Charge submitted to iLab — cannot be re-submitted.",
+                    foreground="#9E9E9E"))
                 self.root.after(0, self._refresh_table)
                 self.root.after(0, lambda: self._set_status(
                     f"Class charge added to request {req_id} in iLab."))
@@ -1279,51 +1469,100 @@ class ILabManagerApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_export_to_schedule(self) -> None:
+    def _on_export_to_schedule(self, silent: bool = False) -> None:
+        """
+        Append the current record to the appropriate training schedule xlsx.
+        silent=True suppresses the success dialog (used for auto-export on completion).
+        """
         if not self._current_rec:
-            messagebox.showwarning("No Selection", "Select a request first.")
+            if not silent:
+                messagebox.showwarning("No Selection", "Select a request first.")
             return
 
         # Save any unsaved training fields first
         self._on_save_training()
 
-        core = self._training_core_var.get().strip().upper()
+        req_id = self._current_rec["request_id"]
+        core   = self._training_core_var.get().strip().upper()
         if not core:
-            messagebox.showwarning(
-                "Core Lab Not Set",
-                "Set the Core Lab (CALM or CVRI) before exporting.\n\n"
-                "Use the Auto-detect button or choose manually.",
-            )
+            if not silent:
+                messagebox.showwarning(
+                    "Core Lab Not Set",
+                    "Set the Core Lab (CALM or CVRI) before exporting.\n\n"
+                    "Use the Auto-detect button or choose manually.",
+                )
+            else:
+                self._set_status(
+                    f"⚠ Request {req_id} marked complete but Core Lab not set — "
+                    "export to schedule manually from the Training tab.")
             return
 
         p = _prefs.get_prefs()
         xlsx_path = str(p.get(f"{core.lower()}_xlsx", "") or "").strip()
         if not xlsx_path:
-            messagebox.showwarning(
-                "xlsx Path Not Configured",
-                f"No {core} schedule xlsx file path is set.\n\n"
-                "Open ⚙ Preferences and browse to your\n"
-                f"Training Schedule_{core}_CURRENT.xlsx file.",
-            )
+            if not silent:
+                messagebox.showwarning(
+                    "xlsx Path Not Configured",
+                    f"No {core} schedule xlsx file path is set.\n\n"
+                    "Open ⚙ Preferences and browse to your\n"
+                    f"Training Schedule_{core}_CURRENT.xlsx file.",
+                )
+            else:
+                self._set_status(
+                    f"⚠ Request {req_id} marked complete — set {core} xlsx path "
+                    "in ⚙ Preferences to enable auto-export.")
             return
 
         if not HAS_OPENPYXL:
-            messagebox.showerror(
-                "openpyxl Required",
-                "Install openpyxl to export to xlsx:\n\n    pip install openpyxl",
-            )
+            if not silent:
+                messagebox.showerror(
+                    "openpyxl Required",
+                    "Install openpyxl to export to xlsx:\n\n    pip install openpyxl",
+                )
             return
 
+        sheet_name = str(p.get(f"{core.lower()}_sheet", "") or "").strip()
+
         try:
-            append_training_row(self._current_rec, xlsx_path)
-            fname = Path(xlsx_path).name
-            self._set_status(f"Row appended to {fname} ({core}).")
-            messagebox.showinfo(
-                "Export Complete",
-                f"Training record appended to:\n{xlsx_path}",
-            )
+            result    = append_training_row(self._current_rec, xlsx_path,
+                                            sheet_name=sheet_name)
+            # Mark as exported so auto-export doesn't run again
+            self._data.update_local_fields(req_id, schedule_exported="1")
+            self._current_rec["schedule_exported"] = "1"
+            self._exported_lbl.config(text="✓ Exported to records")
+            fname     = Path(xlsx_path).name
+            sheet_lbl = f" → '{sheet_name}'" if sheet_name else ""
+            n_written = len(result.get("written", {}))
+            n_empty   = len(result.get("empty", []))
+            self._set_status(
+                f"Row appended to {fname}{sheet_lbl} ({core})  —  "
+                f"{n_written} field(s) written, {n_empty} column(s) unmatched.")
+            if not silent:
+                written_str = "\n".join(
+                    f"  {k}: {v}" for k, v in result.get("written", {}).items()
+                ) or "  (none)"
+                empty_str = ", ".join(result.get("empty", [])) or "none"
+                messagebox.showinfo(
+                    "Export to Records — Complete",
+                    f"Appended to: {fname}"
+                    + (f"\nSheet: {sheet_name}" if sheet_name else "")
+                    + f"\n\nFields written ({n_written}):\n{written_str}"
+                    + f"\n\nUnmatched headers: {empty_str}",
+                )
         except Exception as exc:
-            messagebox.showerror("Export Error", str(exc))
+            if not silent:
+                messagebox.showerror("Export Error", str(exc))
+
+    def _auto_export_on_complete(self, req_id: str) -> None:
+        """Called after a request is marked completed; exports if not already done."""
+        rec = self._data.get_record(req_id)
+        if not rec or rec.get("schedule_exported", "0") == "1":
+            return
+        # Temporarily point _current_rec at this record so the export works
+        saved = self._current_rec
+        self._current_rec = rec
+        self._on_export_to_schedule(silent=True)
+        self._current_rec = saved
 
     def _show_cell_entry(self, row_id: str, col_id: str, field: str) -> None:
         """Overlay a plain Entry widget on a Treeview cell for free-text editing."""
@@ -1361,10 +1600,6 @@ class ILabManagerApp:
 
     def _on_push_state_inline(self, row_id: str, new_state: str) -> None:
         """Push a state change to iLab from a table-cell dropdown."""
-        core_id = self._get_core_id()
-        if not core_id:
-            return
-        # Optimistic local update so the table refreshes immediately
         self._data.update_field(row_id, "state", new_state)
         rec = self._data.get_record(row_id)
         if rec:
@@ -1375,15 +1610,28 @@ class ILabManagerApp:
         except tk.TclError:
             pass
 
+        if rec and rec.get("local_only") == "1":
+            self._set_status(f"Status → {new_state} (local only, not pushed to iLab).")
+            if new_state == "completed":
+                self.root.after(100, lambda: self._auto_export_on_complete(row_id))
+            return
+
+        core_id = self._get_core_id()
+        if not core_id:
+            return
+
         def worker():
             try:
                 client = self._get_client()
                 client.update_service_request(core_id, int(row_id), state=new_state)
                 self.root.after(0, lambda: self._set_status(
-                    f"State → {new_state} pushed to iLab for #{row_id}."))
+                    f"Status → {new_state} pushed to iLab for #{row_id}."))
+                if new_state == "completed":
+                    self.root.after(100, lambda: self._auto_export_on_complete(row_id))
             except Exception as exc:
+                print(f"[iLab Error] inline push state={new_state} req={row_id}: {exc}")
                 self.root.after(0, lambda e=exc: messagebox.showerror(
-                    "iLab Error", f"State updated locally but iLab push failed:\n{e}"))
+                    "iLab Error", f"Status updated locally but iLab push failed:\n{e}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1411,7 +1659,7 @@ class ILabManagerApp:
         dlg.geometry(f"+{max(0, px)}+{max(0, py)}")
 
     def _on_open_preferences(self) -> None:
-        PreferencesDialog(self.root)
+        PreferencesDialog(self.root, dark=self._dark_mode)
 
     def _on_open_in_ilab(self, _event=None) -> None:
         if not self._current_rec:
@@ -1423,6 +1671,116 @@ class ILabManagerApp:
     # =========================================================================
     # Helpers
     # =========================================================================
+
+    def _toggle_dark_mode(self) -> None:
+        self._apply_theme(dark=not self._dark_mode)
+
+    def _apply_theme(self, dark: bool) -> None:
+        self._dark_mode = dark
+        self._dark_btn.config(text="☀  Light" if dark else "🌙 Dark")
+
+        if dark:
+            bg       = "#00003F"
+            bg2      = "#171753"   # treeview / canvas interior
+            bg3      = "#382B58"   # fields, entries
+            fg       = "#1cc2d4"
+            fg2      = "#9aabad"
+            sel_bg   = "#145C8B"
+            sel_fg   = "#f8f3e5"
+            border   = "#4C4683"
+            state_colors = STATE_COLORS_DARK
+        else:
+            bg       = "#f0f0f0"
+            bg2      = "#ffffff"
+            bg3      = "#ffffff"
+            fg       = "#000000"
+            fg2      = "#555555"
+            sel_bg   = "#0078d4"
+            sel_fg   = "#ffffff"
+            border   = "#cccccc"
+            state_colors = STATE_COLORS
+
+        style = ttk.Style(self.root)
+        style.theme_use("clam")   # clam is fully configurable on all platforms
+
+        style.configure(".",
+            background=bg, foreground=fg,
+            fieldbackground=bg3, selectbackground=sel_bg,
+            selectforeground=sel_fg, bordercolor=border,
+            troughcolor=bg2, arrowcolor=fg,
+            insertcolor=fg, relief="flat",
+        )
+        for widget_class in ("TFrame", "TLabelframe", "TPanedwindow"):
+            style.configure(widget_class, background=bg)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TButton", background=bg3, foreground=fg,
+                         bordercolor=border, focuscolor=bg3)
+        style.map("TButton",
+            background=[("active", sel_bg), ("pressed", sel_bg)],
+            foreground=[("active", sel_fg), ("pressed", sel_fg)],
+        )
+        style.configure("TEntry", fieldbackground=bg3, foreground=fg,
+                         bordercolor=border, insertcolor=fg)
+        style.configure("TCombobox", fieldbackground=bg3, foreground=fg,
+                         selectbackground=sel_bg, selectforeground=sel_fg,
+                         bordercolor=border, arrowcolor=fg)
+        style.map("TCombobox",
+            fieldbackground=[("readonly", bg3)],
+            foreground=[("readonly", fg)],
+        )
+        style.configure("TCheckbutton", background=bg, foreground=fg,
+                         focuscolor=bg)
+        style.map("TCheckbutton",
+            background=[("active", bg)],
+            foreground=[("active", fg)],
+        )
+        style.configure("TNotebook", background=bg, bordercolor=border)
+        style.configure("TNotebook.Tab", background=bg3, foreground=fg,
+                         padding=(8, 4))
+        style.map("TNotebook.Tab",
+            background=[("selected", bg2), ("active", sel_bg)],
+            foreground=[("selected", fg), ("active", sel_fg)],
+        )
+        style.configure("TScrollbar", background=bg3, troughcolor=bg2,
+                         bordercolor=border, arrowcolor=fg, relief="flat")
+        style.configure("TSeparator", background=border)
+
+        # Treeview
+        style.configure("Treeview",
+            background=bg2, foreground=fg, fieldbackground=bg2,
+            bordercolor=border, rowheight=22,
+        )
+        style.configure("Treeview.Heading",
+            background=bg3, foreground=fg, bordercolor=border, relief="flat")
+        style.map("Treeview",
+            background=[("selected", sel_bg)],
+            foreground=[("selected", sel_fg)],
+        )
+        for state, color in state_colors.items():
+            self._tree.tag_configure(state, background=color,
+                                     foreground=sel_fg if dark else fg)
+            self._tree.tag_configure(state + "_alt",
+                                     background=_lighten_hex(color),
+                                     foreground=sel_fg if dark else fg)
+
+        # Root window and bare tk widgets
+        self.root.configure(bg=bg)
+
+        if hasattr(self, "_qa_canvas"):
+            self._qa_canvas.configure(bg=bg, highlightthickness=0)
+        if hasattr(self, "_form_canvas"):
+            self._form_canvas.configure(bg=bg, highlightthickness=0)
+        if hasattr(self, "_notes_text"):
+            self._notes_text.configure(
+                bg=bg3, fg=fg, insertbackground=fg,
+                selectbackground=sel_bg, selectforeground=sel_fg,
+            )
+
+        # Persist preference
+        p = _prefs.get_prefs()
+        p["dark_mode"] = "1" if dark else "0"
+        _prefs.save_prefs(p)
 
     def _get_core_id(self) -> str | None:
         """Return the core ID/slug as entered. May be a number ('1234') or a slug ('CALM')."""
@@ -1614,12 +1972,26 @@ class ImportDiagnosticDialog(tk.Toplevel):
 class PreferencesDialog(tk.Toplevel):
     """Modal dialog: xlsx paths and class charge configuration."""
 
-    def __init__(self, parent: tk.Tk):
+    def __init__(self, parent: tk.Tk, dark: bool = False):
         super().__init__(parent)
         self.title("Preferences")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
+
+        # ── Theme colours ─────────────────────────────────────────────────────
+        if dark:
+            self._bg   = "#1e1e1e"
+            self._bg3  = "#3c3c3c"
+            self._fg   = "#d4d4d4"
+            self._fg2  = "#9e9e9e"
+        else:
+            self._bg   = "#f0f0f0"
+            self._bg3  = "#ffffff"
+            self._fg   = "#000000"
+            self._fg2  = "#555555"
+
+        self.configure(bg=self._bg)
 
         p = _prefs.get_prefs()
         self._vars: dict[str, tk.StringVar] = {
@@ -1627,6 +1999,7 @@ class PreferencesDialog(tk.Toplevel):
         }
         # Make sure all expected keys exist
         for k, default in [
+            ("data_file",""),
             ("calm_xlsx",""), ("cvri_xlsx",""),
             ("class_service_id",""), ("class_price_id",""),
             ("class_quantity","2"), ("class_unit_price","100"),
@@ -1634,39 +2007,76 @@ class PreferencesDialog(tk.Toplevel):
             if k not in self._vars:
                 self._vars[k] = tk.StringVar(value=default)
 
+        self._original_data_file = self._vars["data_file"].get()
+
         PAD = dict(padx=8, pady=4)
+
+        # ── Section: shared data file ─────────────────────────────────────────
+        ttk.Label(self, text="Shared Data File",
+                  font=("", 10, "bold")).grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(12, 4))
+
+        ttk.Label(self, text="Data File (CSV):", width=14, anchor="e").grid(
+            row=1, column=0, sticky="e", **PAD)
+        ttk.Entry(self, textvariable=self._vars["data_file"], width=40).grid(
+            row=1, column=1, sticky="ew", **PAD)
+        ttk.Button(self, text="Browse…",
+                   command=self._browse_data_file).grid(row=1, column=2, **PAD)
+
+        ttk.Label(
+            self,
+            text="Point to a OneDrive/shared folder to sync across machines.\n"
+                 "Leave blank to use the default file in the app directory.\n"
+                 "Restart the app after changing this path.",
+            foreground=self._fg2,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=3, column=0, columnspan=4, sticky="ew", padx=10, pady=6)
 
         # ── Section: xlsx files ───────────────────────────────────────────────
         ttk.Label(self, text="Training Schedule Files",
                   font=("", 10, "bold")).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(12, 4))
+            row=4, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
-        for row, (label, key) in enumerate([
-            ("CALM xlsx:", "calm_xlsx"),
-            ("CVRI xlsx:", "cvri_xlsx"),
-        ], start=1):
-            ttk.Label(self, text=label, width=16, anchor="e").grid(
-                row=row, column=0, sticky="e", **PAD)
-            ttk.Entry(self, textvariable=self._vars[key], width=44).grid(
-                row=row, column=1, sticky="w", **PAD)
+        for base_row, (core, path_key, sheet_key) in enumerate([
+            ("CALM", "calm_xlsx", "calm_sheet"),
+            ("CVRI", "cvri_xlsx", "cvri_sheet"),
+        ]):
+            r = 5 + base_row * 2   # two grid rows per core (offset after data-file section)
+
+            # xlsx path row
+            ttk.Label(self, text=f"{core} xlsx:", width=14, anchor="e").grid(
+                row=r, column=0, sticky="e", **PAD)
+            ttk.Entry(self, textvariable=self._vars[path_key], width=40).grid(
+                row=r, column=1, sticky="w", **PAD)
             ttk.Button(self, text="Browse…",
-                       command=lambda k=key: self._browse(k)).grid(
-                row=row, column=2, **PAD)
+                       command=lambda k=path_key: self._browse(k)).grid(
+                row=r, column=2, **PAD)
+
+            # Sheet name row
+            ttk.Label(self, text="Sheet name:", width=14, anchor="e").grid(
+                row=r + 1, column=0, sticky="e", padx=8, pady=(0, 6))
+            ttk.Entry(self, textvariable=self._vars[sheet_key], width=22).grid(
+                row=r + 1, column=1, sticky="w", padx=8, pady=(0, 6))
+            ttk.Label(self, text="(blank = first sheet)",
+                      foreground=self._fg2).grid(
+                row=r + 1, column=2, sticky="w", padx=4, pady=(0, 6))
 
         ttk.Label(
             self,
             text="Point to your existing Training Schedule xlsx files.\n"
                  "If the file does not exist it will be created with default headers.",
-            foreground="#555",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+            foreground=self._fg2,
+        ).grid(row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
         ttk.Separator(self, orient="horizontal").grid(
-            row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=6)
+            row=10, column=0, columnspan=4, sticky="ew", padx=10, pady=6)
 
         # ── Section: class charge ─────────────────────────────────────────────
         ttk.Label(self, text="Class Charge (iLab API)",
                   font=("", 10, "bold")).grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
         for i, (label, key) in enumerate([
             ("Service ID:",     "class_service_id"),
@@ -1674,8 +2084,8 @@ class PreferencesDialog(tk.Toplevel):
             ("Quantity:",       "class_quantity"),
             ("Unit Price ($):", "class_unit_price"),
             ("Max Charge ($):", "max_charge"),
-        ], start=6):
-            ttk.Label(self, text=label, width=16, anchor="e").grid(
+        ], start=12):
+            ttk.Label(self, text=label, width=14, anchor="e").grid(
                 row=i, column=0, sticky="e", **PAD)
             ttk.Entry(self, textvariable=self._vars[key], width=14).grid(
                 row=i, column=1, sticky="w", **PAD)
@@ -1684,15 +2094,15 @@ class PreferencesDialog(tk.Toplevel):
             self,
             text="Run  python get_services.py  to look up Service ID and Price ID.\n"
                  "Leave blank to save Class Taken locally without calling iLab.",
-            foreground="#555",
-        ).grid(row=10, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 8))
+            foreground=self._fg2,
+        ).grid(row=17, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 8))
 
         ttk.Separator(self, orient="horizontal").grid(
-            row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=4)
+            row=18, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(self, padding=(8, 4, 12, 10))
-        btn_row.grid(row=12, column=0, columnspan=3, sticky="e")
+        btn_row.grid(row=19, column=0, columnspan=4, sticky="e")
         ttk.Button(btn_row, text="Save", command=self._save,
                    width=10).pack(side="right", padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy,
@@ -1704,6 +2114,14 @@ class PreferencesDialog(tk.Toplevel):
         py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, px)}+{max(0, py)}")
 
+    def _browse_data_file(self) -> None:
+        path = filedialog.askopenfilename(
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Locate existing ilab_requests_cache.csv",
+        )
+        if path:
+            self._vars["data_file"].set(path)
+
     def _browse(self, key: str) -> None:
         label = "CALM" if "calm" in key else "CVRI"
         path = filedialog.askopenfilename(
@@ -1714,8 +2132,15 @@ class PreferencesDialog(tk.Toplevel):
             self._vars[key].set(path)
 
     def _save(self) -> None:
+        new_data_file = self._vars["data_file"].get().strip()
         _prefs.save_prefs({k: v.get() for k, v in self._vars.items()})
         self.destroy()
+        if new_data_file != self._original_data_file:
+            messagebox.showinfo(
+                "Restart Required",
+                "The Data File path has changed.\n\n"
+                "Please restart the app to load data from the new location.",
+            )
 
 
 # =============================================================================

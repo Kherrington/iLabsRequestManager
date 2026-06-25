@@ -11,7 +11,7 @@ import requests
 from typing import List, Optional, Union
 
 # Core IDs may be numeric (1234) or a slug ("CALM") depending on the iLab instance.
-CoreID = Union[5226, str]
+CoreID = Union[int, str]
 
 
 def _load_dotenv() -> None:
@@ -276,6 +276,8 @@ class ILabClient:
             json={"service_request": fields},
         )
         return data.get("service_request", data)
+
+
 
     # ── Custom Forms ──────────────────────────────────────────────────────────
 
