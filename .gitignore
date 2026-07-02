@@ -1,0 +1,6 @@
+.env
+*.csv
+prefs.json
+config_local.py
+__pycache__/
+*.pyc
