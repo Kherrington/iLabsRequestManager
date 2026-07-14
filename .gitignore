@@ -1,6 +1,11 @@
 .env
 *.csv
 prefs.json
+class_session.json
 config_local.py
+CALM_welcome.txt
+CVRI_welcome.txt
+Common_response.txt
+CVRI-Access.txt
 __pycache__/
 *.pyc

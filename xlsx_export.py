@@ -101,6 +101,32 @@ def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _existing_row_signatures(ws, headers: list) -> set:
+    """Return a set of signature tuples (stripped-string values, aligned to
+    *headers*) for every existing data row, used to detect duplicates before
+    appending a new row."""
+    n = len(headers)
+    sigs = set()
+    for r in range(2, ws.max_row + 1):
+        vals = tuple(str(ws.cell(r, c + 1).value or "").strip() for c in range(n))
+        if any(vals):
+            sigs.add(vals)
+    return sigs
+
+
+def _save_workbook(wb, xlsx_path: str) -> None:
+    """Save *wb*, turning a Windows file-lock error into a message that makes
+    the cause (file open in Excel) obvious to the caller/UI."""
+    try:
+        wb.save(xlsx_path)
+    except PermissionError:
+        raise PermissionError(
+            f"'{Path(xlsx_path).name}' appears to be open in Excel (or another "
+            "program) and can't be saved right now. Close the file and try "
+            "again — your data has not been lost."
+        ) from None
+
+
 def append_training_row(rec: dict, xlsx_path: str,
                         sheet_name: str = "") -> None:
     """
@@ -186,13 +212,30 @@ def append_training_row(rec: dict, xlsx_path: str,
             )
             row.append(fd_val or "")
 
+    # ── Skip if this row already exists ───────────────────────────────────────
+    # Prefer matching on the Request ID column (unique per iLab request) when
+    # the sheet has one; otherwise fall back to an exact full-row match.
+    req_col = next((i for i, h in enumerate(headers)
+                    if h and HEADER_MAP.get(_norm(h)) == "request_id"), None)
+    req_id_val    = str(rec.get("request_id", "") or "").strip()
+    existing_sigs = _existing_row_signatures(ws, headers)
+
+    is_dup = False
+    if req_col is not None and req_id_val:
+        is_dup = any(sig[req_col] == req_id_val for sig in existing_sigs)
+    if not is_dup:
+        is_dup = tuple(str(v or "").strip() for v in row) in existing_sigs
+
+    if is_dup:
+        return {"headers": headers, "written": {}, "empty": [], "duplicate": True}
+
     ws.append(row)
-    wb.save(xlsx_path)
+    _save_workbook(wb, xlsx_path)
 
     # Return a summary for debugging / status messages
     mapped   = {h: v for h, v in zip(headers, row) if v not in (None, "")}
     unmapped = [h for h, v in zip(headers, row) if v in (None, "")]
-    return {"headers": headers, "written": mapped, "empty": unmapped}
+    return {"headers": headers, "written": mapped, "empty": unmapped, "duplicate": False}
 
 
 def _write_headers(ws, headers: list) -> None:
@@ -201,3 +244,103 @@ def _write_headers(ws, headers: list) -> None:
         cell = ws.cell(1, c)
         cell.value = h
         cell.font  = bold
+
+
+# ── Intro Course Log export ───────────────────────────────────────────────────
+
+CLASS_HEADER_MAP: dict[str, str] = {
+    "date":              "date",
+    "class date":        "date",
+    "instructor":        "instructor",
+    "teacher":           "instructor",
+    "taught by":         "instructor",
+    "time":              "time",
+    "class time":        "time",
+    "location":          "location",
+    "room":              "location",
+    "where":             "location",
+    "student":           "name",
+    "student name":      "name",
+    "name":              "name",
+    "people":            "name",
+    "pi":                "pi",
+    "pi / lab":          "pi",
+    "pi/lab":            "pi",
+    "lab":               "pi",
+    "pi name":           "pi",
+    "principal investigator": "pi",
+}
+
+CLASS_DEFAULT_HEADERS = ["Date", "Instructor", "Time", "Location", "Student Name", "PI / Lab"]
+CLASS_DEFAULT_FIELDS  = ["date", "instructor", "time", "location", "name", "pi"]
+
+
+def append_class_session(session: dict, xlsx_path: str,
+                         sheet_name: str = "") -> dict:
+    """
+    Append one row per student to the Microscope Intro Course Log xlsx.
+
+    session keys: date, instructor, time, location,
+                  students (list of {"name": str, "pi": str})
+
+    Returns {"rows_written": int}.
+    """
+    if not HAS_OPENPYXL:
+        raise ImportError(
+            "openpyxl is required for xlsx export.\n"
+            "Install it with:  pip install openpyxl"
+        )
+
+    p = Path(xlsx_path)
+
+    if p.exists():
+        wb = openpyxl.load_workbook(xlsx_path)
+        ws = wb[sheet_name] if (sheet_name and sheet_name in wb.sheetnames) else wb.active
+        raw_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        headers = [str(h).strip() if h is not None else "" for h in raw_headers]
+        while headers and not headers[-1]:
+            headers.pop()
+        if not headers:
+            _write_headers(ws, CLASS_DEFAULT_HEADERS)
+            headers = CLASS_DEFAULT_HEADERS
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = sheet_name or "Intro Course Log"
+        _write_headers(ws, CLASS_DEFAULT_HEADERS)
+        headers = CLASS_DEFAULT_HEADERS
+
+    students = session.get("students") or []
+    existing_sigs = _existing_row_signatures(ws, headers)
+    rows_written = 0
+    duplicates_skipped = 0
+
+    for student in students:
+        flat = {
+            "date":       session.get("date", ""),
+            "instructor": session.get("instructor", ""),
+            "time":       session.get("time", ""),
+            "location":   session.get("location", ""),
+            "name":       student.get("name", ""),
+            "pi":         student.get("pi", ""),
+        }
+        row = []
+        for header in headers:
+            if not header:
+                row.append("")
+                continue
+            field = CLASS_HEADER_MAP.get(_norm(header))
+            row.append(flat.get(field, "") if field else "")
+
+        row_sig = tuple(str(v or "").strip() for v in row)
+        if row_sig in existing_sigs:
+            duplicates_skipped += 1
+            continue
+
+        ws.append(row)
+        existing_sigs.add(row_sig)
+        rows_written += 1
+
+    if rows_written:
+        _save_workbook(wb, xlsx_path)
+    return {"rows_written": rows_written, "duplicates_skipped": duplicates_skipped}

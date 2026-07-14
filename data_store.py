@@ -82,6 +82,7 @@ class DataStore:
     def __init__(self, filepath: str = "ilab_requests_cache.csv"):
         self.filepath = Path(filepath)
         self.records: Dict[str, dict] = {}
+        self.on_change: Optional[Callable[[], None]] = None  # set by app for auto-save
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────────────
@@ -259,6 +260,10 @@ class DataStore:
 
     # ── CRUD helpers ──────────────────────────────────────────────────────────
 
+    def _notify_change(self) -> None:
+        if self.on_change:
+            self.on_change()
+
     def update_local_fields(self, request_id: str, **fields) -> None:
         """Update only local fields (assigned_to, labels, local_notes)."""
         rec = self.records.get(str(request_id))
@@ -268,6 +273,7 @@ class DataStore:
             if key in _LOCAL_COLS:
                 rec[key] = value
         self.save()
+        self._notify_change()
 
     def update_field(self, request_id: str, key: str, value: str) -> None:
         """Update any single field (use for state changes pushed to iLab)."""
@@ -275,12 +281,14 @@ class DataStore:
         if rec is not None:
             rec[key] = value
             self.save()
+            self._notify_change()
 
     def update_milestones(self, request_id: str, milestones: list) -> None:
         rec = self.records.get(str(request_id))
         if rec is not None:
             rec["milestones_data"] = json.dumps(milestones, ensure_ascii=False)
             self.save()
+            self._notify_change()
 
     def add_manual_record(self, fields: dict) -> str:
         """
@@ -311,6 +319,16 @@ class DataStore:
         self.records[req_id] = rec
         self.save()
         return req_id
+
+    def delete_record(self, request_id: str) -> None:
+        """Remove a single record from the cache (e.g. a local-only manual
+        entry that has been exported to the training schedule and no longer
+        needs to be kept around)."""
+        req_id = str(request_id)
+        if req_id in self.records:
+            del self.records[req_id]
+            self.save()
+            self._notify_change()
 
     def clear_all(self) -> None:
         """Remove every cached record and overwrite the CSV with an empty store."""

@@ -21,6 +21,8 @@ _DEFAULTS: dict = {
     "calm_sheet":       "",   # worksheet name to append to; blank = first sheet
     "cvri_xlsx":        "",
     "cvri_sheet":       "",
+    "intro_xlsx":       "",   # Microscope Intro Course Log xlsx
+    "intro_sheet":      "",   # worksheet name; blank = first sheet
     "class_service_id": "",
     "class_price_id":   "",
     "class_quantity":   "2",

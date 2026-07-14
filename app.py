@@ -7,7 +7,9 @@ Set ILAB_TOKEN env var (or add to .env and load before running).
 Set CORE_ID in config.py after running: python get_cores.py
 """
 
+import html
 import json
+import re
 import threading
 import webbrowser
 from datetime import datetime, timezone, date as _date
@@ -16,15 +18,160 @@ from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
 
+try:
+    import win32clipboard
+    HAS_WIN32CLIPBOARD = True
+except ImportError:
+    HAS_WIN32CLIPBOARD = False
+
 import prefs as _prefs
 from calendar_widget import CalendarPicker
-from xlsx_export import append_training_row, HAS_OPENPYXL
+from xlsx_export import append_training_row, append_class_session, HAS_OPENPYXL
 from config import (
     CORE_ID, ILAB_BASE_URL, DATA_FILE, TEAM_MEMBERS, LABELS,
     MICROSCOPES, TRAINING_DAYS, CORE_OPTIONS, ACTIVE_STATES,
 )
 from data_store import DataStore
 from ilabs_client import ILabClient, ILabError
+
+_CS_SESSION_FILE      = Path(__file__).parent / "class_session.json"
+_CALM_WELCOME_FILE    = Path(__file__).parent / "CALM_welcome.txt"
+_CVRI_WELCOME_FILE    = Path(__file__).parent / "CVRI_welcome.txt"
+_COMMON_RESPONSE_FILE = Path(__file__).parent / "Common_response.txt"
+_CVRI_ACCESS_FILE     = Path(__file__).parent / "CVRI-Access.txt"
+
+# ── Email-template markup parser ──────────────────────────────────────────────
+# Supports: **bold**   *italic*   __underline__
+_MARKUP_RE = re.compile(
+    r'\*\*(.+?)\*\*|__(.+?)__|(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)',
+    re.DOTALL,
+)
+
+
+def _parse_template_markup(text: str) -> list[tuple[str, tuple]]:
+    """Return [(chunk, tag_tuple), ...] from marked-up plain text."""
+    result: list[tuple[str, tuple]] = []
+    last = 0
+    for m in _MARKUP_RE.finditer(text):
+        if m.start() > last:
+            result.append((text[last:m.start()], ()))
+        if m.group(1) is not None:
+            result.append((m.group(1), ("bold",)))
+        elif m.group(2) is not None:
+            result.append((m.group(2), ("underline",)))
+        else:
+            result.append((m.group(3), ("italic",)))
+        last = m.end()
+    if last < len(text):
+        result.append((text[last:], ()))
+    return result
+
+
+def _strip_template_markup(text: str) -> str:
+    """Return plain text with all markup markers removed."""
+    return _MARKUP_RE.sub(lambda m: m.group(1) or m.group(2) or m.group(3), text)
+
+
+# ── Rich-text clipboard (preserve bold/italic/underline on paste) ────────────
+_HTML_TAG_MAP = {"bold": "b", "italic": "i", "underline": "u"}
+
+# Bare URLs in template text (http(s):// or www.) get turned into real <a> links.
+_URL_RE = re.compile(r'(https?://\S+|www\.\S+)')
+_URL_TRAILING_PUNCT = '.,;:!?)]}\'\"'
+
+
+def _split_urls(text: str) -> list[tuple[str, bool]]:
+    """Split *text* into (segment, is_link) pieces, trimming trailing
+    punctuation (periods, closing parens, etc.) off detected URLs so
+    sentence punctuation doesn't get swallowed into the link."""
+    parts: list[tuple[str, bool]] = []
+    last = 0
+    for m in _URL_RE.finditer(text):
+        if m.start() > last:
+            parts.append((text[last:m.start()], False))
+        url, trail = m.group(0), ""
+        while url and url[-1] in _URL_TRAILING_PUNCT:
+            trail = url[-1] + trail
+            url = url[:-1]
+        if url:
+            parts.append((url, True))
+        if trail:
+            parts.append((trail, False))
+        last = m.end()
+    if last < len(text):
+        parts.append((text[last:], False))
+    return parts
+
+
+def _runs_to_html(runs: list[tuple[str, str | None]]) -> str:
+    """Convert [(text, tag_or_None), ...] runs into an HTML fragment,
+    wrapping runs in <b>/<i>/<u> per _HTML_TAG_MAP, preserving line breaks,
+    and turning any bare URLs into clickable <a> links."""
+    parts = []
+    for chunk, tag in runs:
+        seg_html = []
+        for seg, is_link in _split_urls(chunk):
+            esc = html.escape(seg).replace("\n", "<br>\n")
+            if is_link:
+                href = seg if seg.lower().startswith(("http://", "https://")) else f"https://{seg}"
+                seg_html.append(f'<a href="{html.escape(href, quote=True)}">{esc}</a>')
+            else:
+                seg_html.append(esc)
+        chunk_html = "".join(seg_html)
+        wrapper = _HTML_TAG_MAP.get(tag)
+        if wrapper:
+            chunk_html = f"<{wrapper}>{chunk_html}</{wrapper}>"
+        parts.append(chunk_html)
+    return "".join(parts)
+
+
+def _build_cf_html(html_fragment: str) -> bytes:
+    """Wrap an HTML fragment in the header Windows' CF_HTML clipboard format
+    requires (byte offsets to the fragment within the whole payload)."""
+    header_tmpl = (
+        "Version:0.9\r\n"
+        "StartHTML:{:09d}\r\n"
+        "EndHTML:{:09d}\r\n"
+        "StartFragment:{:09d}\r\n"
+        "EndFragment:{:09d}\r\n"
+    )
+    prefix = "<html><body>\r\n<!--StartFragment-->"
+    suffix = "<!--EndFragment-->\r\n</body></html>"
+
+    header_len     = len(header_tmpl.format(0, 0, 0, 0).encode("utf-8"))
+    start_html     = header_len
+    start_fragment = start_html + len(prefix.encode("utf-8"))
+    end_fragment   = start_fragment + len(html_fragment.encode("utf-8"))
+    end_html       = end_fragment + len(suffix.encode("utf-8"))
+
+    header = header_tmpl.format(start_html, end_html, start_fragment, end_fragment)
+    return (header + prefix + html_fragment + suffix).encode("utf-8")
+
+
+def _copy_rich_text(plain_text: str, html_fragment: str, tk_root) -> bool:
+    """
+    Put both plain text and HTML on the clipboard so pasting into a rich-text
+    target (Outlook, Word, Gmail compose, etc.) preserves bold/italic/underline.
+
+    Returns True if the HTML format was written (pywin32 available), False if
+    it fell back to plain-text only (still copied via Tk's clipboard).
+    """
+    if not HAS_WIN32CLIPBOARD:
+        tk_root.clipboard_clear()
+        tk_root.clipboard_append(plain_text)
+        return False
+
+    cf_html = win32clipboard.RegisterClipboardFormat("HTML Format")
+    data    = _build_cf_html(html_fragment)
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, plain_text)
+        win32clipboard.SetClipboardData(cf_html, data)
+    finally:
+        win32clipboard.CloseClipboard()
+    return True
+
 
 # ── Colour palette for request states ────────────────────────────────────────
 STATE_COLORS = {
@@ -101,12 +248,32 @@ class ILabManagerApp:
         self._class_taken_var = tk.BooleanVar()
 
         self._dark_mode = False
+        self._autosave_job: str | None = None
 
         self._build_ui()
         self._data.reload()          # pick up any changes written by other machines
         self._refresh_table()
         self._restore_last_sync()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── Auto-save wiring ──────────────────────────────────────────────────
+        # Reset the 60-second timer on any DataStore write
+        self._data.on_change = self._schedule_autosave
+        # Info tab fields (saved only on "Save Local Changes" click)
+        for _var in (self._assigned_var,):
+            _var.trace_add("write", self._schedule_autosave)
+        for _var in self._label_vars.values():
+            _var.trace_add("write", self._schedule_autosave)
+        self._notes_text.bind("<KeyRelease>", self._schedule_autosave)
+        # Training tab fields (saved only on "Save Training Info" click)
+        for _var in (self._training_core_var, self._training_micro_var,
+                     self._training_date_var, self._training_day_var,
+                     self._training_time_var):
+            _var.trace_add("write", self._schedule_autosave)
+        # Class Schedule session-info fields
+        for _var in (self._cs_date_var, self._cs_instructor_var,
+                     self._cs_time_var, self._cs_location_var):
+            _var.trace_add("write", self._schedule_autosave)
 
         # Apply saved theme after UI is fully built
         _dark_pref = str(_p.get("dark_mode", "0")).strip() == "1"
@@ -261,6 +428,7 @@ class ILabManagerApp:
         self._build_form_tab()
         self._build_milestones_tab()
         self._build_training_tab()
+        self._build_class_schedule_tab()
 
     # ── Quick-actions bar (milestone buttons, always visible) ─────────────────
 
@@ -331,6 +499,10 @@ class ILabManagerApp:
             self._info_vars[key] = var
             ttk.Label(left, textvariable=var, anchor="w").grid(
                 row=i, column=1, sticky="w", padx=4, pady=2)
+            if key == "owner_email":
+                ttk.Button(left, text="Copy", width=5,
+                           command=lambda k=key: self._copy_info_field(k)).grid(
+                    row=i, column=2, sticky="w", padx=(2, 4), pady=2)
 
         # State push
         sep_row = len(ilab_fields) + 2
@@ -412,6 +584,177 @@ class ILabManagerApp:
             foreground="#888")
         self._form_placeholder.grid(row=0, column=0, padx=12, pady=12)
 
+    # ── Email-template viewer / editor ───────────────────────────────────────
+
+    def _open_template_view(self, title: str, path: Path) -> None:
+        """Show a formatted read-only view of an email template file."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.geometry("620x460")
+        dlg.resizable(True, True)
+        dlg.transient(self.root)
+
+        # Scrollable text area
+        frm = ttk.Frame(dlg)
+        frm.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+        sb  = ttk.Scrollbar(frm, orient="vertical")
+        txt = tk.Text(frm, wrap="word", padx=10, pady=10,
+                      state="disabled", yscrollcommand=sb.set,
+                      font=("", 10))
+        sb.config(command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+
+        txt.tag_configure("bold",      font=("", 10, "bold"))
+        txt.tag_configure("italic",    font=("", 10, "italic"))
+        txt.tag_configure("underline", underline=True)
+
+        def _reload():
+            content = path.read_text(encoding="utf-8") if path.exists() else (
+                f"[No template file yet — click Edit to create {path.name}]")
+            txt.config(state="normal")
+            txt.delete("1.0", "end")
+            for chunk, tags in _parse_template_markup(content):
+                txt.insert("end", chunk, tags)
+            txt.config(state="disabled")
+
+        _reload()
+
+        def _runs_in_range(start: str, end: str) -> list[tuple[str, str | None]]:
+            """Walk txt[start:end] character by character, merging consecutive
+            runs that share the same bold/italic/underline tag."""
+            runs: list[tuple[str, str | None]] = []
+            idx = start
+            while txt.compare(idx, "<", end):
+                nxt = txt.index(f"{idx}+1c")
+                ch  = txt.get(idx, nxt)
+                tag = next((t for t in txt.tag_names(idx)
+                           if t in ("bold", "italic", "underline")), None)
+                if runs and runs[-1][1] == tag:
+                    runs[-1] = (runs[-1][0] + ch, tag)
+                else:
+                    runs.append((ch, tag))
+                idx = nxt
+            return runs
+
+        def _copy_formatted(event=None):
+            """Copy the current selection (or the whole template if nothing is
+            selected) to the clipboard, preserving bold/italic/underline for
+            pasting into Outlook / Word / Gmail compose etc."""
+            try:
+                start, end = txt.index("sel.first"), txt.index("sel.last")
+            except tk.TclError:
+                start, end = "1.0", "end-1c"
+            plain = txt.get(start, end)
+            if not plain:
+                return "break"
+            html_fragment = _runs_to_html(_runs_in_range(start, end))
+            rich = _copy_rich_text(plain, html_fragment, self.root)
+            self._set_status(
+                "Copied with formatting." if rich else
+                "Copied as plain text (install pywin32 to preserve formatting).")
+            return "break"
+
+        txt.bind("<<Copy>>",    _copy_formatted)
+        txt.bind("<Control-c>", _copy_formatted)
+
+        # Button bar
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+
+        def _copy_plain():
+            content = path.read_text(encoding="utf-8") if path.exists() else ""
+            self.root.clipboard_clear()
+            self.root.clipboard_append(_strip_template_markup(content))
+            self._set_status(f"'{title}' copied to clipboard.")
+
+        def _edit():
+            dlg.destroy()
+            self._open_template_edit(title, path)
+
+        ttk.Button(bar, text="Copy (Formatted)", command=_copy_formatted).pack(side="left")
+        ttk.Button(bar, text="Copy as Text",     command=_copy_plain).pack(side="left", padx=6)
+        ttk.Button(bar, text="Edit…",            command=_edit).pack(side="left", padx=6)
+        ttk.Button(bar, text="Close",            command=dlg.destroy).pack(side="right")
+
+        dlg.update_idletasks()
+        px = self.root.winfo_rootx() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        py = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+    def _open_template_edit(self, title: str, path: Path) -> None:
+        """Open a simple markup editor for an email template file."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Edit — {title}")
+        dlg.geometry("620x480")
+        dlg.resizable(True, True)
+        dlg.transient(self.root)
+
+        # Formatting toolbar
+        toolbar = ttk.Frame(dlg)
+        toolbar.pack(fill="x", padx=8, pady=(8, 2))
+
+        txt_ref: list[tk.Text] = []   # filled after txt is created
+
+        def _wrap(marker: str):
+            txt = txt_ref[0]
+            try:
+                sel = txt.get("sel.first", "sel.last")
+                txt.delete("sel.first", "sel.last")
+                txt.insert("insert", f"{marker}{sel}{marker}")
+            except tk.TclError:
+                txt.insert("insert", f"{marker}{marker}")
+                # Move cursor between the markers
+                idx = txt.index("insert")
+                r, c = map(int, idx.split("."))
+                txt.mark_set("insert", f"{r}.{c - len(marker)}")
+
+        ttk.Button(toolbar, text="B", width=3,
+                   command=lambda: _wrap("**")).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="I", width=3,
+                   command=lambda: _wrap("*")).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="U", width=3,
+                   command=lambda: _wrap("__")).pack(side="left", padx=2)
+        ttk.Label(toolbar,
+                  text="  Select text, then B / I / U   ·   **bold**  *italic*  __underline__",
+                  foreground="gray").pack(side="left", padx=6)
+
+        # Text editor
+        frm = ttk.Frame(dlg)
+        frm.pack(fill="both", expand=True, padx=8, pady=4)
+        sb  = ttk.Scrollbar(frm, orient="vertical")
+        txt = tk.Text(frm, wrap="word", padx=10, pady=10, undo=True,
+                      yscrollcommand=sb.set, font=("", 10))
+        sb.config(command=txt.yview)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt_ref.append(txt)
+
+        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        txt.insert("1.0", content)
+
+        # Button bar
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+
+        def _save():
+            path.write_text(txt.get("1.0", "end-1c"), encoding="utf-8")
+            self._set_status(f"Saved {path.name}.")
+            dlg.destroy()
+
+        def _preview():
+            self._open_template_view(title, path)
+
+        ttk.Button(bar, text="Save",    command=_save).pack(side="left")
+        ttk.Button(bar, text="Cancel",  command=dlg.destroy).pack(side="left", padx=6)
+        ttk.Button(bar, text="Preview", command=_preview).pack(side="right")
+
+        dlg.update_idletasks()
+        px = self.root.winfo_rootx() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        py = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(0, px)}+{max(0, py)}")
+        txt.focus_set()
+
     def _build_milestones_tab(self) -> None:
         """Track Work tab — custom pre/post-training workflow checklist."""
         tab = ttk.Frame(self._notebook, padding=10)
@@ -471,8 +814,24 @@ class ILabManagerApp:
         pre = ttk.LabelFrame(cols, text="Pre-Training", padding=10)
         pre.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
-        _chk(pre, "wf_laser_safety",        "Laser Safety")
-        _chk(pre, "wf_emailed",            "Emailed User")
+        _chk(pre, "wf_laser_safety", "Laser Safety")
+
+        # Emailed User + Common Response template link
+        emailed_row = ttk.Frame(pre)
+        emailed_row.pack(anchor="w", pady=3)
+        ttk.Checkbutton(emailed_row, variable=self._wf_vars["wf_emailed"],
+                        command=_save_wf).pack(side="left")
+        ttk.Label(emailed_row, text="Emailed User").pack(side="left")
+        cr_link = ttk.Label(emailed_row, text="  Common Response",
+                            foreground="#1565C0", cursor="hand2")
+        cr_link.pack(side="left", padx=(8, 0))
+        cr_link.bind("<Button-1>",
+                     lambda e: self._open_template_view("Common Response",
+                                                        _COMMON_RESPONSE_FILE))
+        ttk.Button(emailed_row, text="Edit", width=5,
+                   command=lambda: self._open_template_edit("Common Response",
+                                                            _COMMON_RESPONSE_FILE),
+                   ).pack(side="left", padx=4)
         # Class? — Yes / No on one row
         class_row = ttk.Frame(pre)
         class_row.pack(anchor="w", pady=3)
@@ -497,12 +856,53 @@ class ILabManagerApp:
 
         _chk(pre, "wf_training_scheduled", "Training Scheduled")
 
+        # CVRI-Access template
+        cvri_access_row = ttk.Frame(pre)
+        cvri_access_row.pack(anchor="w", pady=2, padx=(20, 0))
+        cvri_access_link = ttk.Label(cvri_access_row, text="CVRI-Access",
+                                     foreground="#1565C0", cursor="hand2")
+        cvri_access_link.pack(side="left")
+        cvri_access_link.bind("<Button-1>",
+                              lambda e: self._open_template_view("CVRI-Access",
+                                                                 _CVRI_ACCESS_FILE))
+        ttk.Button(cvri_access_row, text="Edit", width=5,
+                   command=lambda: self._open_template_edit("CVRI-Access",
+                                                            _CVRI_ACCESS_FILE),
+                   ).pack(side="left", padx=4)
+
         # Post-Training column
         post = ttk.LabelFrame(cols, text="Post-Training", padding=10)
         post.pack(side="left", fill="both", expand=True, padx=(6, 0))
 
-        _chk(post, "wf_post_email",
-             "Post-Training Email")
+        _chk(post, "wf_post_email", "Post-Training Email")
+
+        # CALM Welcome template
+        calm_row = ttk.Frame(post)
+        calm_row.pack(anchor="w", pady=2, padx=(20, 0))
+        calm_link = ttk.Label(calm_row, text="CALM Welcome",
+                              foreground="#1565C0", cursor="hand2")
+        calm_link.pack(side="left")
+        calm_link.bind("<Button-1>",
+                       lambda e: self._open_template_view("CALM Welcome",
+                                                          _CALM_WELCOME_FILE))
+        ttk.Button(calm_row, text="Edit", width=5,
+                   command=lambda: self._open_template_edit("CALM Welcome",
+                                                            _CALM_WELCOME_FILE),
+                   ).pack(side="left", padx=4)
+
+        # CVRI Welcome template
+        cvri_row = ttk.Frame(post)
+        cvri_row.pack(anchor="w", pady=2, padx=(20, 0))
+        cvri_link = ttk.Label(cvri_row, text="CVRI Welcome",
+                              foreground="#1565C0", cursor="hand2")
+        cvri_link.pack(side="left")
+        cvri_link.bind("<Button-1>",
+                       lambda e: self._open_template_view("CVRI Welcome",
+                                                          _CVRI_WELCOME_FILE))
+        ttk.Button(cvri_row, text="Edit", width=5,
+                   command=lambda: self._open_template_edit("CVRI Welcome",
+                                                            _CVRI_WELCOME_FILE),
+                   ).pack(side="left", padx=4)
         _chk(post, "wf_post_listserve",
              "List Serve",
              url="https://listsrv.ucsf.edu/")
@@ -634,6 +1034,394 @@ class ILabManagerApp:
         ttk.Label(right, text=guide, justify="left",
                   foreground="#444").pack(anchor="nw")
 
+    # ── Class Schedule tab ────────────────────────────────────────────────────
+
+    def _build_class_schedule_tab(self) -> None:
+        tab = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(tab, text="  Class Schedule  ")
+
+        # All sessions; selected session index
+        self._cs_sessions: list[dict] = []
+        self._cs_sel_idx: int | None  = None
+
+        # Fields for the currently selected session
+        self._cs_date_var       = tk.StringVar()
+        self._cs_instructor_var = tk.StringVar()
+        self._cs_time_var       = tk.StringVar()
+        self._cs_location_var   = tk.StringVar()
+
+        # ── Horizontal pane: sessions list (left) | session detail (right) ────
+        paned = ttk.PanedWindow(tab, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # ── Left: upcoming sessions list ──────────────────────────────────────
+        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
+        paned.add(left, weight=1)
+
+        ttk.Label(left, text="Upcoming Sessions",
+                  font=("", 9, "bold")).pack(anchor="w", pady=(0, 3))
+
+        sess_frame = ttk.Frame(left)
+        sess_frame.pack(fill="both", expand=True)
+
+        self._cs_sess_tree = ttk.Treeview(
+            sess_frame, columns=("date", "instructor"),
+            show="headings", selectmode="browse", height=14)
+        self._cs_sess_tree.heading("date",       text="Date")
+        self._cs_sess_tree.heading("instructor", text="Instructor")
+        self._cs_sess_tree.column("date",        width=90,  minwidth=70)
+        self._cs_sess_tree.column("instructor",  width=110, minwidth=70)
+        self._cs_sess_tree.bind("<<TreeviewSelect>>", self._cs_on_session_select)
+
+        sess_vsb = ttk.Scrollbar(sess_frame, orient="vertical",
+                                  command=self._cs_sess_tree.yview)
+        self._cs_sess_tree.configure(yscrollcommand=sess_vsb.set)
+        sess_vsb.pack(side="right", fill="y")
+        self._cs_sess_tree.pack(fill="both", expand=True)
+
+        sess_btns = ttk.Frame(left)
+        sess_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(sess_btns, text="+ New Session",
+                   command=self._cs_new_session).pack(side="left", padx=(0, 4))
+        ttk.Button(sess_btns, text="Delete",
+                   command=self._cs_delete_session).pack(side="left")
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=8)
+
+        ttk.Button(left, text="Export Session to Log →",
+                   command=self._cs_export).pack(anchor="w")
+        self._cs_export_lbl = ttk.Label(left, text="", foreground="#2E7D32")
+        self._cs_export_lbl.pack(anchor="w", pady=(2, 0))
+
+        # ── Right: session detail (info + students) ───────────────────────────
+        right = ttk.Frame(paned, padding=(6, 0, 0, 0))
+        paned.add(right, weight=3)
+
+        # Session info fields
+        info = ttk.LabelFrame(right, text="Session Info", padding=8)
+        info.pack(fill="x", pady=(0, 6))
+
+        LW = 11
+        ttk.Label(info, text="Date:", anchor="e", width=LW).grid(
+            row=0, column=0, sticky="e", padx=4, pady=3)
+        date_f = ttk.Frame(info)
+        date_f.grid(row=0, column=1, sticky="w", padx=4, pady=3)
+        ttk.Entry(date_f, textvariable=self._cs_date_var, width=13).pack(side="left")
+        ttk.Button(date_f, text="📅", width=3,
+                   command=self._cs_pick_date).pack(side="left", padx=(4, 0))
+
+        ttk.Label(info, text="Instructor:", anchor="e", width=LW).grid(
+            row=0, column=2, sticky="e", padx=(16, 4), pady=3)
+        ttk.Combobox(info, textvariable=self._cs_instructor_var,
+                     values=TEAM_MEMBERS, width=20).grid(
+            row=0, column=3, sticky="w", padx=4, pady=3)
+
+        ttk.Label(info, text="Time:", anchor="e", width=LW).grid(
+            row=1, column=0, sticky="e", padx=4, pady=3)
+        ttk.Entry(info, textvariable=self._cs_time_var, width=14).grid(
+            row=1, column=1, sticky="w", padx=4, pady=3)
+
+        ttk.Label(info, text="Location:", anchor="e", width=LW).grid(
+            row=1, column=2, sticky="e", padx=(16, 4), pady=3)
+        ttk.Entry(info, textvariable=self._cs_location_var, width=22).grid(
+            row=1, column=3, sticky="w", padx=4, pady=3)
+
+        ttk.Button(info, text="Save Session Info",
+                   command=self._cs_save_info).grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 0))
+
+        # Students table
+        stu_frame = ttk.LabelFrame(right, text="Students in Class", padding=6)
+        stu_frame.pack(fill="both", expand=True)
+
+        self._cs_tree = ttk.Treeview(
+            stu_frame, columns=("name", "pi"),
+            show="headings", selectmode="browse", height=8)
+        self._cs_tree.heading("name", text="Student Name")
+        self._cs_tree.heading("pi",   text="PI / Lab")
+        self._cs_tree.column("name", width=210, minwidth=100)
+        self._cs_tree.column("pi",   width=190, minwidth=80)
+        self._cs_tree.bind("<Double-1>", self._cs_edit_student)
+
+        stu_vsb = ttk.Scrollbar(stu_frame, orient="vertical",
+                                 command=self._cs_tree.yview)
+        self._cs_tree.configure(yscrollcommand=stu_vsb.set)
+        stu_vsb.pack(side="right", fill="y")
+        self._cs_tree.pack(fill="both", expand=True)
+
+        stu_btns = ttk.Frame(stu_frame)
+        stu_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(stu_btns, text="+ Add from Selected Request",
+                   command=self._cs_add_from_selection).pack(side="left", padx=(0, 6))
+        ttk.Button(stu_btns, text="+ Add Manually",
+                   command=self._cs_add_student).pack(side="left", padx=(0, 6))
+        ttk.Button(stu_btns, text="Remove",
+                   command=self._cs_remove_student).pack(side="left")
+
+        self._cs_load()
+
+    # ── Class Schedule handlers ───────────────────────────────────────────────
+
+    def _cs_load(self) -> None:
+        """Load all sessions from JSON and populate the sessions list."""
+        try:
+            raw = json.loads(_CS_SESSION_FILE.read_text(encoding="utf-8"))
+            # Support old single-session format (dict) and new list format
+            if isinstance(raw, dict):
+                raw = [raw]
+            self._cs_sessions = raw
+        except Exception:
+            self._cs_sessions = []
+        self._cs_refresh_sessions_tree()
+
+    def _cs_persist(self) -> None:
+        """Write all sessions to JSON."""
+        try:
+            _CS_SESSION_FILE.write_text(
+                json.dumps(self._cs_sessions, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception as exc:
+            self._set_status(f"Could not save sessions: {exc}")
+
+    def _cs_refresh_sessions_tree(self) -> None:
+        """Rebuild the left-hand sessions list."""
+        self._cs_sess_tree.delete(*self._cs_sess_tree.get_children())
+        for i, s in enumerate(self._cs_sessions):
+            self._cs_sess_tree.insert("", "end", iid=str(i),
+                                       values=(s.get("date", ""),
+                                               s.get("instructor", "")))
+
+    def _cs_on_session_select(self, _event=None) -> None:
+        """Load the selected session's info and students into the right panel."""
+        sel = self._cs_sess_tree.selection()
+        if not sel:
+            return
+        self._cs_sel_idx = int(sel[0])
+        sess = self._cs_sessions[self._cs_sel_idx]
+        self._cs_date_var.set(sess.get("date", ""))
+        self._cs_instructor_var.set(sess.get("instructor", ""))
+        self._cs_time_var.set(sess.get("time", ""))
+        self._cs_location_var.set(sess.get("location", ""))
+        self._cs_export_lbl.config(text="")
+        self._cs_refresh_students_tree()
+
+    def _cs_new_session(self) -> None:
+        """Append a blank session and select it."""
+        self._cs_sessions.append(
+            {"date": "", "instructor": "", "time": "", "location": "",
+             "students": []})
+        self._cs_persist()
+        self._cs_refresh_sessions_tree()
+        new_iid = str(len(self._cs_sessions) - 1)
+        self._cs_sess_tree.selection_set(new_iid)
+        self._cs_sess_tree.see(new_iid)
+
+    def _cs_delete_session(self) -> None:
+        if self._cs_sel_idx is None:
+            return
+        sess = self._cs_sessions[self._cs_sel_idx]
+        label = sess.get("date") or f"session {self._cs_sel_idx + 1}"
+        if not messagebox.askyesno("Delete Session",
+                                   f"Delete {label} and all its students?"):
+            return
+        self._cs_sessions.pop(self._cs_sel_idx)
+        self._cs_sel_idx = None
+        self._cs_persist()
+        self._cs_refresh_sessions_tree()
+        # Clear the right panel
+        self._cs_date_var.set("")
+        self._cs_instructor_var.set("")
+        self._cs_time_var.set("")
+        self._cs_location_var.set("")
+        self._cs_refresh_students_tree()
+        self._cs_export_lbl.config(text="")
+
+    def _cs_save_info(self) -> None:
+        """Save the session info fields back into the sessions list."""
+        if self._cs_sel_idx is None:
+            messagebox.showwarning("No Session Selected",
+                                   "Select or create a session first.")
+            return
+        sess = self._cs_sessions[self._cs_sel_idx]
+        sess["date"]       = self._cs_date_var.get().strip()
+        sess["instructor"] = self._cs_instructor_var.get().strip()
+        sess["time"]       = self._cs_time_var.get().strip()
+        sess["location"]   = self._cs_location_var.get().strip()
+        self._cs_persist()
+        # Refresh the sessions list so date/instructor column updates
+        sel_iid = str(self._cs_sel_idx)
+        self._cs_refresh_sessions_tree()
+        self._cs_sess_tree.selection_set(sel_iid)
+        self._set_status("Session info saved.")
+
+    def _cs_refresh_students_tree(self) -> None:
+        self._cs_tree.delete(*self._cs_tree.get_children())
+        if self._cs_sel_idx is None:
+            return
+        students = self._cs_sessions[self._cs_sel_idx].get("students", [])
+        for i, s in enumerate(students):
+            self._cs_tree.insert("", "end", iid=str(i),
+                                  values=(s.get("name", ""), s.get("pi", "")))
+
+    def _cs_add_from_selection(self) -> None:
+        """Add the currently selected iLab request's requester to the student list."""
+        if self._cs_sel_idx is None:
+            messagebox.showwarning("No Session Selected",
+                                   "Select or create a session first.")
+            return
+        if not self._current_rec:
+            messagebox.showwarning("No Request Selected",
+                                   "Select a service request in the table above first,\n"
+                                   "then click Add from Selected Request.")
+            return
+        name = (self._current_rec.get("owner_name") or "").strip()
+        pi   = (self._current_rec.get("pi_name")    or "").strip()
+        if not name:
+            messagebox.showwarning("No Name",
+                                   "The selected request has no requester name.")
+            return
+        # Pre-fill the dialog so the user can confirm / tweak before adding
+        self._cs_student_dialog(prefill={"name": name, "pi": pi})
+
+    def _cs_add_student(self) -> None:
+        if self._cs_sel_idx is None:
+            messagebox.showwarning("No Session Selected",
+                                   "Select or create a session first.")
+            return
+        self._cs_student_dialog()
+
+    def _cs_edit_student(self, _event=None) -> None:
+        sel = self._cs_tree.selection()
+        if sel:
+            self._cs_student_dialog(edit_idx=int(sel[0]))
+
+    def _cs_student_dialog(self, edit_idx: int | None = None,
+                            prefill: dict | None = None) -> None:
+        students = self._cs_sessions[self._cs_sel_idx].get("students", [])
+        existing = students[edit_idx] if edit_idx is not None else (prefill or {})
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Edit Student" if edit_idx is not None else "Add Student")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack()
+
+        name_var = tk.StringVar(value=existing.get("name", ""))
+        pi_var   = tk.StringVar(value=existing.get("pi", ""))
+
+        ttk.Label(frame, text="Student Name:").grid(
+            row=0, column=0, sticky="e", padx=4, pady=4)
+        name_entry = ttk.Entry(frame, textvariable=name_var, width=30)
+        name_entry.grid(row=0, column=1, sticky="w", padx=4, pady=4)
+
+        ttk.Label(frame, text="PI / Lab:").grid(
+            row=1, column=0, sticky="e", padx=4, pady=4)
+        ttk.Entry(frame, textvariable=pi_var, width=30).grid(
+            row=1, column=1, sticky="w", padx=4, pady=4)
+
+        def _save():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("Missing Name", "Enter a student name.",
+                                       parent=dlg)
+                return
+            student = {"name": name, "pi": pi_var.get().strip()}
+            if edit_idx is not None:
+                students[edit_idx] = student
+            else:
+                students.append(student)
+            self._cs_sessions[self._cs_sel_idx]["students"] = students
+            self._cs_refresh_students_tree()
+            self._cs_persist()
+            dlg.destroy()
+
+        btn = ttk.Frame(frame)
+        btn.grid(row=2, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(btn, text="Save",   command=_save).pack(side="left", padx=(0, 6))
+        ttk.Button(btn, text="Cancel", command=dlg.destroy).pack(side="left")
+
+        name_entry.focus_set()
+        name_entry.select_range(0, "end")
+        dlg.bind("<Return>", lambda e: _save())
+
+    def _cs_remove_student(self) -> None:
+        if self._cs_sel_idx is None:
+            return
+        sel = self._cs_tree.selection()
+        if not sel:
+            return
+        students = self._cs_sessions[self._cs_sel_idx].get("students", [])
+        students.pop(int(sel[0]))
+        self._cs_sessions[self._cs_sel_idx]["students"] = students
+        self._cs_refresh_students_tree()
+        self._cs_persist()
+
+    def _cs_pick_date(self) -> None:
+        raw = self._cs_date_var.get().strip()
+        initial = None
+        try:
+            initial = _date.fromisoformat(raw)
+        except ValueError:
+            pass
+        CalendarPicker(self.root, self._cs_date_selected, initial)
+
+    def _cs_date_selected(self, date_str: str) -> None:
+        self._cs_date_var.set(date_str)
+        # Auto-save the date into the session immediately
+        if self._cs_sel_idx is not None:
+            self._cs_sessions[self._cs_sel_idx]["date"] = date_str
+            self._cs_persist()
+            sel_iid = str(self._cs_sel_idx)
+            self._cs_refresh_sessions_tree()
+            self._cs_sess_tree.selection_set(sel_iid)
+
+    def _cs_export(self) -> None:
+        if self._cs_sel_idx is None:
+            messagebox.showwarning("No Session Selected",
+                                   "Select a session to export.")
+            return
+        p = _prefs.get_prefs()
+        xlsx_path = str(p.get("intro_xlsx", "") or "").strip()
+        if not xlsx_path:
+            messagebox.showwarning(
+                "xlsx Path Not Set",
+                "Set the Microscope Intro Course Log path in ⚙ Preferences.",
+            )
+            return
+        if not HAS_OPENPYXL:
+            messagebox.showerror(
+                "openpyxl Required",
+                "Install openpyxl to export to xlsx:\n\n    pip install openpyxl",
+            )
+            return
+
+        sess = self._cs_sessions[self._cs_sel_idx]
+        if not sess.get("students"):
+            messagebox.showwarning("No Students",
+                                   "Add at least one student before exporting.")
+            return
+
+        sheet_name = str(p.get("intro_sheet", "") or "").strip()
+        try:
+            ok, result = self._run_export_with_retry(
+                lambda: append_class_session(sess, xlsx_path, sheet_name=sheet_name),
+                silent=False,
+            )
+            if not ok:
+                return
+            n   = result.get("rows_written", 0)
+            dup = result.get("duplicates_skipped", 0)
+            dup_lbl = f", {dup} duplicate(s) skipped" if dup else ""
+            self._cs_export_lbl.config(text=f"✓ {n} row(s) written{dup_lbl}")
+            self._set_status(
+                f"Session exported to {Path(xlsx_path).name}"
+                f" — {n} student row(s) written{dup_lbl}.")
+        except Exception as exc:
+            messagebox.showerror("Export Error", str(exc))
+
     # ── Status bar ────────────────────────────────────────────────────────────
 
     def _build_status_bar(self) -> None:
@@ -644,6 +1432,9 @@ class ILabManagerApp:
         self._last_sync_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self._last_sync_var,
                   anchor="e", foreground="#666").pack(side="right")
+        self._autosave_status_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._autosave_status_var,
+                  anchor="e", foreground="#888").pack(side="right", padx=(0, 12))
 
     # =========================================================================
     # Table management
@@ -1091,6 +1882,11 @@ class ILabManagerApp:
             self._current_rec["state"] = new_state
             self._info_vars["state"].set(new_state)
             self._refresh_table()
+            try:
+                self._tree.selection_set(req_id)
+                self._tree.see(req_id)
+            except tk.TclError:
+                pass
             self._set_status(f"Status → '{new_state}' (local only).")
             if new_state == "completed":
                 self.root.after(100, lambda: self._auto_export_on_complete(req_id))
@@ -1112,6 +1908,8 @@ class ILabManagerApp:
                 self._current_rec["state"] = new_state
                 self.root.after(0, lambda: self._info_vars["state"].set(new_state))
                 self.root.after(0, self._refresh_table)
+                self.root.after(50, lambda r=req_id: (
+                    self._tree.selection_set(r), self._tree.see(r)))
                 self.root.after(0, lambda: self._set_status(
                     f"Status → '{new_state}' pushed to iLab for request {req_id}."))
                 if new_state == "completed":
@@ -1187,6 +1985,7 @@ class ILabManagerApp:
                 self.root.after(0, lambda: self._set_status(
                     f"Sync complete — {count} active request(s) loaded."))
                 self.root.after(0, lambda t=when: self._set_last_sync(t))
+                self.root.after(0, self._cleanup_completed_local_entries)
                 self.root.after(0, self._refresh_table)
             except ILabError as exc:
                 msg = str(exc)
@@ -1475,21 +2274,31 @@ class ILabManagerApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_export_to_schedule(self, silent: bool = False) -> None:
+    def _on_export_to_schedule(self, silent: bool = False) -> bool:
         """
         Append the current record to the appropriate training schedule xlsx.
         silent=True suppresses the success dialog (used for auto-export on completion).
+
+        Returns True if the row was actually written, False otherwise (so callers
+        know not to discard/clear data that was never successfully exported).
         """
         if not self._current_rec:
             if not silent:
                 messagebox.showwarning("No Selection", "Select a request first.")
-            return
+            return False
 
-        # Save any unsaved training fields first
-        self._on_save_training()
+        if not silent:
+            # Save any unsaved training fields first (interactive mode only —
+            # in silent/auto-export mode the UI may reflect a different record)
+            self._on_save_training()
 
         req_id = self._current_rec["request_id"]
-        core   = self._training_core_var.get().strip().upper()
+        # Read core from the record itself so auto-export works even when the
+        # Training tab is showing a different request's fields
+        core   = self._current_rec.get("core_lab", "").strip().upper()
+        if not core and not silent:
+            # Fall back to the UI widget in case the user just changed it
+            core = self._training_core_var.get().strip().upper()
         if not core:
             if not silent:
                 messagebox.showwarning(
@@ -1501,7 +2310,7 @@ class ILabManagerApp:
                 self._set_status(
                     f"⚠ Request {req_id} marked complete but Core Lab not set — "
                     "export to schedule manually from the Training tab.")
-            return
+            return False
 
         p = _prefs.get_prefs()
         xlsx_path = str(p.get(f"{core.lower()}_xlsx", "") or "").strip()
@@ -1517,7 +2326,7 @@ class ILabManagerApp:
                 self._set_status(
                     f"⚠ Request {req_id} marked complete — set {core} xlsx path "
                     "in ⚙ Preferences to enable auto-export.")
-            return
+            return False
 
         if not HAS_OPENPYXL:
             if not silent:
@@ -1525,50 +2334,151 @@ class ILabManagerApp:
                     "openpyxl Required",
                     "Install openpyxl to export to xlsx:\n\n    pip install openpyxl",
                 )
-            return
+            return False
 
         sheet_name = str(p.get(f"{core.lower()}_sheet", "") or "").strip()
 
-        try:
-            result    = append_training_row(self._current_rec, xlsx_path,
-                                            sheet_name=sheet_name)
-            # Mark as exported so auto-export doesn't run again
-            self._data.update_local_fields(req_id, schedule_exported="1")
-            self._current_rec["schedule_exported"] = "1"
-            self._exported_lbl.config(text="✓ Exported to records")
-            fname     = Path(xlsx_path).name
-            sheet_lbl = f" → '{sheet_name}'" if sheet_name else ""
-            n_written = len(result.get("written", {}))
-            n_empty   = len(result.get("empty", []))
+        ok, result = self._run_export_with_retry(
+            lambda: append_training_row(self._current_rec, xlsx_path,
+                                        sheet_name=sheet_name),
+            silent=silent,
+        )
+        if not ok:
+            return False
+
+        # Mark as exported so auto-export doesn't run again
+        self._data.update_local_fields(req_id, schedule_exported="1")
+        self._current_rec["schedule_exported"] = "1"
+        self._exported_lbl.config(text="✓ Exported to records")
+        fname     = Path(xlsx_path).name
+        sheet_lbl = f" → '{sheet_name}'" if sheet_name else ""
+
+        if result.get("duplicate"):
             self._set_status(
-                f"Row appended to {fname}{sheet_lbl} ({core})  —  "
-                f"{n_written} field(s) written, {n_empty} column(s) unmatched.")
+                f"Row already present in {fname}{sheet_lbl} ({core}) — "
+                "skipped duplicate.")
             if not silent:
-                written_str = "\n".join(
-                    f"  {k}: {v}" for k, v in result.get("written", {}).items()
-                ) or "  (none)"
-                empty_str = ", ".join(result.get("empty", [])) or "none"
                 messagebox.showinfo(
-                    "Export to Records — Complete",
-                    f"Appended to: {fname}"
-                    + (f"\nSheet: {sheet_name}" if sheet_name else "")
-                    + f"\n\nFields written ({n_written}):\n{written_str}"
-                    + f"\n\nUnmatched headers: {empty_str}",
+                    "Export to Records",
+                    f"A matching row already exists in {fname} — "
+                    "skipped to avoid writing a duplicate.",
                 )
-        except Exception as exc:
-            if not silent:
-                messagebox.showerror("Export Error", str(exc))
+            return True
+
+        n_written = len(result.get("written", {}))
+        n_empty   = len(result.get("empty", []))
+        self._set_status(
+            f"Row appended to {fname}{sheet_lbl} ({core})  —  "
+            f"{n_written} field(s) written, {n_empty} column(s) unmatched.")
+        if not silent:
+            written_str = "\n".join(
+                f"  {k}: {v}" for k, v in result.get("written", {}).items()
+            ) or "  (none)"
+            empty_str = ", ".join(result.get("empty", [])) or "none"
+            messagebox.showinfo(
+                "Export to Records — Complete",
+                f"Appended to: {fname}"
+                + (f"\nSheet: {sheet_name}" if sheet_name else "")
+                + f"\n\nFields written ({n_written}):\n{written_str}"
+                + f"\n\nUnmatched headers: {empty_str}",
+            )
+        return True
+
+    def _run_export_with_retry(self, fn, silent: bool):
+        """
+        Call the zero-arg *fn* (an xlsx export call). If it fails because the
+        target file is open in Excel (PermissionError), offer a Retry/Cancel
+        prompt in interactive mode so the user can close Excel and retry
+        without losing the data; in silent/auto-export mode, just report the
+        failure via the status bar instead of blocking with a dialog.
+
+        Returns (True, result) on success, (False, None) if the export was
+        never completed. Non-lock exceptions propagate to the caller.
+        """
+        while True:
+            try:
+                return True, fn()
+            except PermissionError as exc:
+                if silent:
+                    self._set_status(f"⚠ Export skipped — {exc}")
+                    return False, None
+                if not messagebox.askretrycancel("File In Use", str(exc)):
+                    return False, None
+                # Loop back and retry the save.
+
+    def _cleanup_completed_local_entries(self) -> None:
+        """Run after an iLab sync: local-only manual entries don't come back
+        from iLab, so sync's own stale-record cleanup never touches them.
+        Sweep for any that are marked completed and clear them out (exporting
+        to the schedule first if that hasn't happened yet)."""
+        for rec in list(self._data.all_records()):
+            if rec.get("local_only") == "1" and rec.get("state") == "completed":
+                self._auto_export_on_complete(rec["request_id"])
 
     def _auto_export_on_complete(self, req_id: str) -> None:
-        """Called after a request is marked completed; exports if not already done."""
+        """Called after a request is marked completed; exports if not already done,
+        then clears training fields from the record and resets the Training UI.
+
+        Local-only manual entries are deleted outright once export is confirmed
+        (rather than just having their training fields wiped), since they have
+        no corresponding iLab request and exist only to get into the schedule.
+        """
         rec = self._data.get_record(req_id)
-        if not rec or rec.get("schedule_exported", "0") == "1":
+        if not rec:
             return
-        # Temporarily point _current_rec at this record so the export works
-        saved = self._current_rec
-        self._current_rec = rec
-        self._on_export_to_schedule(silent=True)
-        self._current_rec = saved
+        already_exported = rec.get("schedule_exported", "0") == "1"
+
+        if not already_exported:
+            # Temporarily point _current_rec at this record so the export works
+            saved = self._current_rec
+            self._current_rec = rec
+            exported = self._on_export_to_schedule(silent=True)
+            self._current_rec = saved
+
+            if not exported:
+                # Export didn't happen (e.g. xlsx open in Excel) — keep the
+                # training fields intact so nothing is lost; the row will be
+                # exported (and only then cleared) next time it succeeds.
+                return
+
+        if rec.get("local_only") == "1":
+            # Local-only manual entries have no corresponding iLab request —
+            # once the row is confirmed written to the schedule there's
+            # nothing left worth keeping, so drop the placeholder entirely
+            # instead of just wiping its training fields. This also cleans
+            # up any local entries that were exported earlier but, for
+            # whatever reason, never got cleared (e.g. an older cache).
+            self._data.delete_record(req_id)
+            if self._current_rec and self._current_rec.get("request_id") == req_id:
+                self._current_rec = None
+            self._refresh_table()
+            self._set_status(
+                f"Local entry {req_id} written to schedule and cleared.")
+            return
+
+        if already_exported:
+            return
+
+        # After export: wipe training fields so the record is clean
+        _CLEAR = dict(
+            training_date="", training_day="", training_time="",
+            microscope="", core_lab="", local_notes="",
+        )
+        self._data.update_local_fields(req_id, **_CLEAR)
+        rec.update(_CLEAR)
+
+        # If this record is still on screen, reset the Training tab widgets
+        if self._current_rec and self._current_rec.get("request_id") == req_id:
+            self._current_rec.update(_CLEAR)
+            self._training_date_var.set("")
+            self._training_day_var.set("")
+            self._training_time_var.set("")
+            self._training_micro_var.set("")
+            self._training_core_var.set("")
+            try:
+                self._notes_text.delete("1.0", "end")
+            except Exception:
+                pass
 
     def _show_cell_entry(self, row_id: str, col_id: str, field: str) -> None:
         """Overlay a plain Entry widget on a Treeview cell for free-text editing."""
@@ -1610,9 +2520,14 @@ class ILabManagerApp:
         rec = self._data.get_record(row_id)
         if rec:
             rec["state"] = new_state
+        # Keep detail panel in sync if this is the currently displayed record
+        if self._current_rec and self._current_rec.get("request_id") == row_id:
+            self._current_rec["state"] = new_state
+            self._info_vars["state"].set(new_state)
         self._refresh_table()
         try:
             self._tree.selection_set(row_id)
+            self._tree.see(row_id)
         except tk.TclError:
             pass
 
@@ -1788,6 +2703,16 @@ class ILabManagerApp:
         p["dark_mode"] = "1" if dark else "0"
         _prefs.save_prefs(p)
 
+    def _copy_info_field(self, key: str) -> None:
+        """Copy the current value of an iLab info field (e.g. owner_email) to
+        the system clipboard."""
+        value = self._info_vars.get(key, tk.StringVar()).get().strip()
+        if not value:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(value)
+        self._set_status(f"Copied '{value}' to clipboard.")
+
     def _get_core_id(self) -> str | None:
         """Return the core ID/slug as entered. May be a number ('1234') or a slug ('CALM')."""
         val = self._core_id_var.get().strip()
@@ -1827,6 +2752,41 @@ class ILabManagerApp:
             "error":   "#E53935",   # red
         }
         self._sync_indicator.config(bg=_COLORS.get(state, "#C8C8C8"))
+
+    def _schedule_autosave(self, *_) -> None:
+        """Debounce: reset the 60-second auto-save countdown on any change."""
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+        self._autosave_job = self.root.after(60_000, self._do_autosave)
+        self._autosave_status_var.set("● unsaved")
+
+    def _do_autosave(self) -> None:
+        """Flush all pending UI edits and save to disk."""
+        self._autosave_job = None
+        # Pause the change callback so the saves below don't re-trigger the timer
+        old_on_change = self._data.on_change
+        self._data.on_change = None
+        try:
+            if self._current_rec:
+                req_id = self._current_rec["request_id"]
+                # Flush Info tab local fields (notes, assigned-to, labels)
+                active_lbls = ",".join(l for l, v in self._label_vars.items() if v.get())
+                notes       = self._notes_text.get("1.0", "end-1c")
+                assigned    = self._assigned_var.get()
+                self._data.update_local_fields(req_id, assigned_to=assigned,
+                                               labels=active_lbls, local_notes=notes)
+                self._current_rec.update(assigned_to=assigned,
+                                         labels=active_lbls, local_notes=notes)
+                # Flush Training tab fields
+                self._on_save_training()
+            # Flush Class Schedule session info if a session is selected
+            if getattr(self, "_cs_sel_idx", None) is not None:
+                self._cs_save_info()
+            self._data.save()
+        finally:
+            self._data.on_change = old_on_change
+        when = datetime.now().strftime("%I:%M %p")
+        self._autosave_status_var.set(f"✓ auto-saved {when}")
 
     def _set_status(self, msg: str) -> None:
         self._status_var.set(msg)
@@ -2007,6 +2967,7 @@ class PreferencesDialog(tk.Toplevel):
         for k, default in [
             ("data_file",""),
             ("calm_xlsx",""), ("cvri_xlsx",""),
+            ("intro_xlsx",""), ("intro_sheet",""),
             ("class_service_id",""), ("class_price_id",""),
             ("class_quantity","2"), ("class_unit_price","100"),
         ]:
@@ -2079,10 +3040,41 @@ class PreferencesDialog(tk.Toplevel):
         ttk.Separator(self, orient="horizontal").grid(
             row=10, column=0, columnspan=4, sticky="ew", padx=10, pady=6)
 
+        # ── Section: intro course log ─────────────────────────────────────────
+        ttk.Label(self, text="Microscope Intro Course Log",
+                  font=("", 10, "bold")).grid(
+            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+
+        ttk.Label(self, text="Intro Log xlsx:", width=14, anchor="e").grid(
+            row=12, column=0, sticky="e", **PAD)
+        ttk.Entry(self, textvariable=self._vars["intro_xlsx"], width=40).grid(
+            row=12, column=1, sticky="w", **PAD)
+        ttk.Button(self, text="Browse…",
+                   command=lambda: self._browse("intro_xlsx")).grid(
+            row=12, column=2, **PAD)
+
+        ttk.Label(self, text="Sheet name:", width=14, anchor="e").grid(
+            row=13, column=0, sticky="e", padx=8, pady=(0, 6))
+        ttk.Entry(self, textvariable=self._vars["intro_sheet"], width=22).grid(
+            row=13, column=1, sticky="w", padx=8, pady=(0, 6))
+        ttk.Label(self, text="(blank = first sheet)",
+                  foreground=self._fg2).grid(
+            row=13, column=2, sticky="w", padx=4, pady=(0, 6))
+
+        ttk.Label(
+            self,
+            text="Points to your Microscope Intro Course Log.xlsx.\n"
+                 "Used by the Class Schedule tab to log weekly class sessions.",
+            foreground=self._fg2,
+        ).grid(row=14, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=15, column=0, columnspan=4, sticky="ew", padx=10, pady=6)
+
         # ── Section: class charge ─────────────────────────────────────────────
         ttk.Label(self, text="Class Charge (iLab API)",
                   font=("", 10, "bold")).grid(
-            row=11, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+            row=16, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
         for i, (label, key) in enumerate([
             ("Service ID:",     "class_service_id"),
@@ -2090,7 +3082,7 @@ class PreferencesDialog(tk.Toplevel):
             ("Quantity:",       "class_quantity"),
             ("Unit Price ($):", "class_unit_price"),
             ("Max Charge ($):", "max_charge"),
-        ], start=12):
+        ], start=17):
             ttk.Label(self, text=label, width=14, anchor="e").grid(
                 row=i, column=0, sticky="e", **PAD)
             ttk.Entry(self, textvariable=self._vars[key], width=14).grid(
@@ -2101,14 +3093,14 @@ class PreferencesDialog(tk.Toplevel):
             text="Run  python get_services.py  to look up Service ID and Price ID.\n"
                  "Leave blank to save Class Taken locally without calling iLab.",
             foreground=self._fg2,
-        ).grid(row=17, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 8))
+        ).grid(row=22, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 8))
 
         ttk.Separator(self, orient="horizontal").grid(
-            row=18, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
+            row=23, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(self, padding=(8, 4, 12, 10))
-        btn_row.grid(row=19, column=0, columnspan=4, sticky="e")
+        btn_row.grid(row=24, column=0, columnspan=4, sticky="e")
         ttk.Button(btn_row, text="Save", command=self._save,
                    width=10).pack(side="right", padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy,
@@ -2129,10 +3121,15 @@ class PreferencesDialog(tk.Toplevel):
             self._vars["data_file"].set(path)
 
     def _browse(self, key: str) -> None:
-        label = "CALM" if "calm" in key else "CVRI"
+        if "intro" in key:
+            label = "Microscope Intro Course Log"
+        elif "calm" in key:
+            label = "CALM Training Schedule"
+        else:
+            label = "CVRI Training Schedule"
         path = filedialog.askopenfilename(
             filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
-            title=f"Select {label} Training Schedule xlsx",
+            title=f"Select {label} xlsx",
         )
         if path:
             self._vars[key].set(path)
