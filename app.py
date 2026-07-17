@@ -2754,10 +2754,10 @@ class ILabManagerApp:
         self._sync_indicator.config(bg=_COLORS.get(state, "#C8C8C8"))
 
     def _schedule_autosave(self, *_) -> None:
-        """Debounce: reset the 30-second auto-save countdown on any change."""
+        """Debounce: reset the 5-second auto-save countdown on any change."""
         if self._autosave_job:
             self.root.after_cancel(self._autosave_job)
-        self._autosave_job = self.root.after(30_000, self._do_autosave)
+        self._autosave_job = self.root.after(5_000, self._do_autosave)
         self._autosave_status_var.set("● unsaved")
 
     def _do_autosave(self) -> None:
