@@ -60,6 +60,11 @@ ACTIVE_STATES = [
     "researcher_in_agreement",
 ]
 
+# ── Common Response template image ────────────────────────────────────────────
+# Path to PNG/JPG image to copy alongside Common Response text
+# Leave as None or "" to disable image copying
+COMMON_RESPONSE_IMAGE = None   # e.g., "Common_response_image.png"
+
 # ── Preferences file (xlsx paths, class charge IDs) ───────────────────────────
 PREFS_FILE = "prefs.json"
 

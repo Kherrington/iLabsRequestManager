@@ -30,15 +30,17 @@ from xlsx_export import append_training_row, append_class_session, HAS_OPENPYXL
 from config import (
     CORE_ID, ILAB_BASE_URL, DATA_FILE, TEAM_MEMBERS, LABELS,
     MICROSCOPES, TRAINING_DAYS, CORE_OPTIONS, ACTIVE_STATES,
+    COMMON_RESPONSE_IMAGE,
 )
 from data_store import DataStore
 from ilabs_client import ILabClient, ILabError
 
-_CS_SESSION_FILE      = Path(__file__).parent / "class_session.json"
-_CALM_WELCOME_FILE    = Path(__file__).parent / "CALM_welcome.txt"
-_CVRI_WELCOME_FILE    = Path(__file__).parent / "CVRI_welcome.txt"
-_COMMON_RESPONSE_FILE = Path(__file__).parent / "Common_response.txt"
-_CVRI_ACCESS_FILE     = Path(__file__).parent / "CVRI-Access.txt"
+_CS_SESSION_FILE         = Path(__file__).parent / "class_session.json"
+_CALM_WELCOME_FILE       = Path(__file__).parent / "CALM_welcome.txt"
+_CVRI_WELCOME_FILE       = Path(__file__).parent / "CVRI_welcome.txt"
+_COMMON_RESPONSE_FILE    = Path(__file__).parent / "Common_response.txt"
+_COMMON_RESPONSE_IMG_FILE = Path(__file__).parent / "Common_response_image.txt"
+_CVRI_ACCESS_FILE        = Path(__file__).parent / "CVRI-Access.txt"
 
 # ── Email-template markup parser ──────────────────────────────────────────────
 # Supports: **bold**   *italic*   __underline__
@@ -171,6 +173,33 @@ def _copy_rich_text(plain_text: str, html_fragment: str, tk_root) -> bool:
     finally:
         win32clipboard.CloseClipboard()
     return True
+
+
+def _copy_image_to_clipboard(image_path: str | Path) -> bool:
+    """Copy image file to clipboard. Returns True if successful, False otherwise."""
+    from pathlib import Path
+    image_path = Path(image_path)
+
+    if not image_path.exists():
+        return False
+
+    if not HAS_WIN32CLIPBOARD:
+        return False
+
+    try:
+        with open(image_path, "rb") as f:
+            image_data = f.read()
+
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            # CF_DIB is the device-independent bitmap format used by most applications
+            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, image_data)
+        finally:
+            win32clipboard.CloseClipboard()
+        return True
+    except Exception:
+        return False
 
 
 # ── Colour palette for request states ────────────────────────────────────────
@@ -668,12 +697,29 @@ class ILabManagerApp:
             self.root.clipboard_append(_strip_template_markup(content))
             self._set_status(f"'{title}' copied to clipboard.")
 
+        def _copy_image():
+            img_filename = _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip() if _COMMON_RESPONSE_IMG_FILE.exists() else ""
+            if not img_filename:
+                self._set_status("No image configured.")
+                return
+            img_path = Path(__file__).parent / img_filename
+            if not img_path.exists():
+                self._set_status(f"Image file not found: {img_path}")
+                return
+            if _copy_image_to_clipboard(img_path):
+                self._set_status(f"Image copied to clipboard.")
+            else:
+                self._set_status(f"Failed to copy image (requires pywin32).")
+
         def _edit():
             dlg.destroy()
             self._open_template_edit(title, path)
 
         ttk.Button(bar, text="Copy (Formatted)", command=_copy_formatted).pack(side="left")
         ttk.Button(bar, text="Copy as Text",     command=_copy_plain).pack(side="left", padx=6)
+        # Show Copy Image button if image is configured
+        if _COMMON_RESPONSE_IMG_FILE.exists() and _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip():
+            ttk.Button(bar, text="Copy Image",   command=_copy_image).pack(side="left", padx=6)
         ttk.Button(bar, text="Edit…",            command=_edit).pack(side="left", padx=6)
         ttk.Button(bar, text="Close",            command=dlg.destroy).pack(side="right")
 
@@ -733,12 +779,39 @@ class ILabManagerApp:
         content = path.read_text(encoding="utf-8") if path.exists() else ""
         txt.insert("1.0", content)
 
+        # Image selector (if this is Common Response template)
+        img_var = None
+        if title == "Common Response":
+            img_frame = ttk.LabelFrame(dlg, text="Associated Image (optional)", padding=6)
+            img_frame.pack(fill="x", padx=8, pady=4)
+
+            saved_img = _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip() if _COMMON_RESPONSE_IMG_FILE.exists() else ""
+            img_var = tk.StringVar(value=saved_img)
+
+            ttk.Label(img_frame, text="Image file:").pack(side="left", padx=(0, 4))
+            ttk.Entry(img_frame, textvariable=img_var, width=40).pack(side="left", padx=4, fill="x", expand=True)
+
+            def _browse_image():
+                f = filedialog.askopenfilename(
+                    title="Select Image",
+                    filetypes=[("PNG files", "*.png"), ("JPG files", "*.jpg *.jpeg"), ("All files", "*.*")]
+                )
+                if f:
+                    img_var.set(Path(f).name)
+
+            ttk.Button(img_frame, text="Browse…", command=_browse_image, width=10).pack(side="left")
+
         # Button bar
         bar = ttk.Frame(dlg)
         bar.pack(fill="x", padx=8, pady=(0, 8))
 
         def _save():
             path.write_text(txt.get("1.0", "end-1c"), encoding="utf-8")
+            # Save image path if this is Common Response template
+            if title == "Common Response" and 'img_var' in locals():
+                img_filename = img_var.get().strip()
+                if img_filename:
+                    _COMMON_RESPONSE_IMG_FILE.write_text(img_filename, encoding="utf-8")
             self._set_status(f"Saved {path.name}.")
             dlg.destroy()
 
