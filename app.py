@@ -187,18 +187,40 @@ def _copy_image_to_clipboard(image_path: str | Path) -> bool:
         return False
 
     try:
-        with open(image_path, "rb") as f:
-            image_data = f.read()
+        from PIL import Image
+        import io
+
+        # Load image and convert to RGB if needed (removes alpha channel)
+        img = Image.open(image_path)
+        if img.mode in ("RGBA", "LA", "P"):
+            # Create white background
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # Convert to BMP format (DIB)
+        bmp_buffer = io.BytesIO()
+        img.save(bmp_buffer, format="BMP")
+        bmp_data = bmp_buffer.getvalue()
+
+        # BMP format: skip the 14-byte file header, use only the DIB data
+        dib_data = bmp_data[14:]
 
         win32clipboard.OpenClipboard()
         try:
             win32clipboard.EmptyClipboard()
-            # CF_DIB is the device-independent bitmap format used by most applications
-            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, image_data)
+            win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib_data)
         finally:
             win32clipboard.CloseClipboard()
         return True
-    except Exception:
+    except ImportError:
+        # Fallback if PIL not available
+        return False
+    except Exception as e:
         return False
 
 
