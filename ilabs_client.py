@@ -340,10 +340,20 @@ class ILabClient:
                             charge.get("service_id"),
                             charge.get("price_id")
                         )
+                        print(f"DEBUG: Price object response: {price_obj}")
                         price = float(price_obj.get("price", 0))
-                        print(f"DEBUG: Fetched price {price} for charge {charge.get('id')}")
+                        print(f"DEBUG: Extracted price field: {price}")
+                        # If price is 0, check for alternative field names
+                        if price == 0:
+                            for key in ["unit_price", "amount", "value", "cost"]:
+                                if key in price_obj:
+                                    price = float(price_obj.get(key, 0))
+                                    print(f"DEBUG: Found {key} field: {price}")
+                                    break
                     except Exception as e:
                         print(f"DEBUG: Failed to fetch price for charge {charge.get('id')}: {e}")
+                        import traceback
+                        traceback.print_exc()
                         # Assume quantity is the amount if we can't fetch price
                         price = quantity
                 else:
