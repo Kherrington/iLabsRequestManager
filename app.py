@@ -2317,7 +2317,14 @@ class ILabManagerApp:
         if core_id is not None:
             try:
                 client = self._get_client()
+                charges = client.list_charges(core_id, int(req_id))
+                print(f"DEBUG: Found {len(charges)} charges for request {req_id}")
+                for c in charges:
+                    print(f"  - Charge {c.get('id')}: qty={c.get('quantity')}, price_id={c.get('price_id')}, billing_status={c.get('billing_status')}")
+
                 existing_total = client.get_total_charges(core_id, int(req_id))
+                print(f"DEBUG: Existing total = ${existing_total:.2f}, New charge = ${total:.2f}, Max = ${_MAX_CHARGE:.2f}")
+
                 if existing_total + total > _MAX_CHARGE:
                     self._class_taken_var.set(False)
                     messagebox.showerror(
@@ -2328,11 +2335,12 @@ class ILabManagerApp:
                     )
                     return
             except Exception as e:
-                # If we can't check existing charges, show a warning but continue
-                if "validate_min_charge" not in str(e):
-                    self._class_taken_var.set(False)
-                    messagebox.showerror("Error Checking Charges", str(e))
-                    return
+                print(f"DEBUG: Exception checking charges: {e}")
+                import traceback
+                traceback.print_exc()
+                self._class_taken_var.set(False)
+                messagebox.showerror("Error Checking Charges", str(e))
+                return
 
         if not svc_id or not price_id or svc_id == "0" or price_id == "0":
             # Charge IDs not configured — save locally with a reminder

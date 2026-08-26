@@ -341,11 +341,16 @@ class ILabClient:
                             charge.get("price_id")
                         )
                         price = float(price_obj.get("price", 0))
-                    except Exception:
-                        price = 0.0
+                        print(f"DEBUG: Fetched price {price} for charge {charge.get('id')}")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to fetch price for charge {charge.get('id')}: {e}")
+                        # Assume quantity is the amount if we can't fetch price
+                        price = quantity
                 else:
                     price = float(price or 0)
+                print(f"DEBUG: Charge {charge.get('id')}: qty={quantity}, price={price}, subtotal={quantity * price}")
                 total += quantity * price
+        print(f"DEBUG: Total charges: ${total:.2f}")
         return total
 
     def validate_min_charge(
