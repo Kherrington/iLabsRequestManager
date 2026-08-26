@@ -289,6 +289,11 @@ class ILabManagerApp:
 
         _p = _prefs.get_prefs()
         _data_path = str(_p.get("data_file", "") or "").strip() or DATA_FILE
+        # Resolve relative paths to app directory to avoid duplicate caches
+        from pathlib import Path as _Path
+        _data_path_obj = _Path(_data_path)
+        if not _data_path_obj.is_absolute():
+            _data_path = str(_Path(__file__).parent / _data_path)
         self._data = DataStore(_data_path)
         self._client: ILabClient | None = None
         self._current_rec: dict | None = None

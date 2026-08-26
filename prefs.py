@@ -16,7 +16,9 @@ _PREFS_FILE = Path(__file__).parent / "prefs.json"
 
 _DEFAULTS: dict = {
     "dark_mode":        "0",
-    "data_file":        "",   # path to ilab_requests_cache.csv; blank = app directory
+    "data_file":        "",   # absolute path to ilab_requests_cache.csv; blank = app directory
+                              # To sync across multiple users, set to shared OneDrive/network path
+                              # Example: "C:\\Users\\NIC-ADMIN4\\OneDrive - UCSF\\Documents - CALM\\shared_cache.csv"
     "calm_xlsx":        "",
     "calm_sheet":       "",   # worksheet name to append to; blank = first sheet
     "cvri_xlsx":        "",
