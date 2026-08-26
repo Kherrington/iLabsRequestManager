@@ -331,8 +331,21 @@ class ILabClient:
         for charge in charges:
             if charge.get("billing_status") != "cancelled":
                 quantity = float(charge.get("quantity", 0))
-                unit_price = float(charge.get("unit_price", 0))
-                total += quantity * unit_price
+                # Try to get price from charge object, or from price API if needed
+                price = charge.get("price")
+                if price is None and charge.get("price_id") and charge.get("service_id"):
+                    try:
+                        price_obj = self.get_price(
+                            core_id,
+                            charge.get("service_id"),
+                            charge.get("price_id")
+                        )
+                        price = float(price_obj.get("price", 0))
+                    except Exception:
+                        price = 0.0
+                else:
+                    price = float(price or 0)
+                total += quantity * price
         return total
 
     def validate_min_charge(

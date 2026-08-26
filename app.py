@@ -2312,6 +2312,28 @@ class ILabManagerApp:
             )
             return
 
+        # Check if request already has charges that would be exceeded
+        core_id = self._get_core_id()
+        if core_id is not None:
+            try:
+                client = self._get_client()
+                existing_total = client.get_total_charges(core_id, int(req_id))
+                if existing_total + total > _MAX_CHARGE:
+                    self._class_taken_var.set(False)
+                    messagebox.showerror(
+                        "Charge Limit Exceeded",
+                        f"Request {req_id} already has ${existing_total:,.2f} in charges.\n\n"
+                        f"Adding ${total:,.2f} would total ${existing_total + total:,.2f}, "
+                        f"exceeding the maximum of ${_MAX_CHARGE:,.2f}.",
+                    )
+                    return
+            except Exception as e:
+                # If we can't check existing charges, show a warning but continue
+                if "validate_min_charge" not in str(e):
+                    self._class_taken_var.set(False)
+                    messagebox.showerror("Error Checking Charges", str(e))
+                    return
+
         if not svc_id or not price_id or svc_id == "0" or price_id == "0":
             # Charge IDs not configured — save locally with a reminder
             self._data.update_local_fields(req_id, class_taken="1")
@@ -2322,7 +2344,6 @@ class ILabManagerApp:
             self._refresh_table()
             return
 
-        core_id = self._get_core_id()
         if core_id is None:
             self._class_taken_var.set(False)
             return
