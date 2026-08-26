@@ -2340,7 +2340,7 @@ class ILabManagerApp:
                     "price_id":   int(price_id),
                     "service_id": int(svc_id),
                     "note":       "Class attendance",
-                }])
+                }], max_charge=_MAX_CHARGE)
                 # Mark each new charge as completed
                 raw_charges = result.get("charges") or []
                 if isinstance(raw_charges, dict):

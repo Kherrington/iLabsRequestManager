@@ -324,8 +324,52 @@ class ILabClient:
             "charges",
         )
 
+    def get_total_charges(self, core_id: int, request_id: int) -> float:
+        """Calculate total charge amount for a service request (active charges only)."""
+        charges = self.list_charges(core_id, request_id)
+        total = 0.0
+        for charge in charges:
+            if charge.get("billing_status") != "cancelled":
+                quantity = float(charge.get("quantity", 0))
+                unit_price = float(charge.get("unit_price", 0))
+                total += quantity * unit_price
+        return total
+
+    def validate_min_charge(
+        self, core_id: int, request_id: int, min_charge: float = 200.0
+    ) -> bool:
+        """Check if request has at least min_charge amount. Raises ILabError if not."""
+        total = self.get_total_charges(core_id, request_id)
+        if total < min_charge:
+            raise ILabError(
+                400,
+                f"Request {request_id} has ${total:.2f} in charges, "
+                f"but minimum ${min_charge:.2f} is required before reading.",
+            )
+        return True
+
+    def can_add_charges(
+        self, core_id: int, request_id: int, charges: List[dict], max_charge: float = 200.0
+    ) -> bool:
+        """Check if adding charges would exceed max_charge limit. Raises ILabError if exceeded."""
+        current_total = self.get_total_charges(core_id, request_id)
+        new_total = current_total
+        for charge in charges:
+            quantity = float(charge.get("quantity", 0))
+            unit_price = float(charge.get("unit_price", 0))
+            new_total += quantity * unit_price
+
+        if new_total > max_charge:
+            raise ILabError(
+                400,
+                f"Adding these charges would result in ${new_total:.2f} total, "
+                f"exceeding the maximum of ${max_charge:.2f}. "
+                f"Current total: ${current_total:.2f}",
+            )
+        return True
+
     def add_charges(
-        self, core_id: int, request_id: int, charges: List[dict]
+        self, core_id: int, request_id: int, charges: List[dict], max_charge: float = 200.0
     ) -> dict:
         """
         Add one or more charges to a service request.
@@ -336,7 +380,10 @@ class ILabClient:
           service_id (int)
         Optional per charge:
           note       (str)
+
+        Raises ILabError if adding charges would exceed max_charge limit.
         """
+        self.can_add_charges(core_id, request_id, charges, max_charge)
         return self._request(
             "POST",
             f"/cores/{core_id}/service_requests/{request_id}/charges.json",
