@@ -10,6 +10,7 @@ export_expanded() flattens form_data fields into individual columns.
 
 import csv
 import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -79,11 +80,34 @@ ALL_COLS = _FIXED_COLS + _LOCAL_COLS + _BLOB_COLS
 
 
 class DataStore:
-    def __init__(self, filepath: str = "ilab_requests_cache.csv"):
+    def __init__(self, filepath: str = "ilab_requests_cache.csv",
+                 remote_sheet: str = "Cache"):
+        """*filepath* is a local CSV, or an Excel Online URL (OneDrive /
+        SharePoint).  In the URL case the workbook's *remote_sheet* worksheet
+        is the shared source of truth and a local CSV mirror is kept for
+        offline start-up."""
+        from graph_excel import is_graph_url, GraphSheet
+        self.remote = None
+        if is_graph_url(str(filepath)):
+            self.remote = GraphSheet(str(filepath), remote_sheet or "Cache")
+            filepath = Path(__file__).parent / "ilab_requests_cache_mirror.csv"
         self.filepath = Path(filepath)
         self.records: Dict[str, dict] = {}
         self.on_change: Optional[Callable[[], None]] = None  # set by app for auto-save
+        # Remote-sync state (Excel Online mode)
+        self.on_remote_status: Optional[Callable[[str, bool], None]] = None
+        self.remote_error: str = ""
+        self._pushed: Dict[str, tuple] = {}     # last state known to be in Excel
+        self._remote_synced = False
+        self._remote_lock = threading.RLock()
+        self._flag_lock = threading.Lock()
+        self._push_wanted = False
+        self._worker: Optional[threading.Thread] = None
         self._load()
+        if self.remote is not None:
+            # The mirror is the last state we saw in Excel; only edits made
+            # after start-up count as unpushed.
+            self._pushed = {k: self._row_tuple(r) for k, r in self.records.items()}
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -95,8 +119,15 @@ class DataStore:
                 self.records[row["request_id"]] = row
 
     def reload(self) -> None:
-        """Re-read the CSV from disk, merging remote changes while preserving
-        any in-memory local fields that are newer than what's on disk."""
+        """Re-read shared data and merge it into memory.
+
+        CSV mode: disk wins for iLab fields; in-memory wins for local fields.
+        Excel Online mode: the workbook wins for everything except rows with
+        local edits that haven't been pushed yet.
+        """
+        if self.remote is not None:
+            self._reload_remote()
+            return
         if not self.filepath.exists():
             return
         disk_records: Dict[str, dict] = {}
@@ -116,11 +147,118 @@ class DataStore:
             if req_id not in self.records:
                 self.records[req_id] = disk_rec
 
-    def save(self) -> None:
+    # ── Excel Online (Microsoft Graph) ────────────────────────────────────────
+
+    @staticmethod
+    def _row_tuple(rec: dict) -> tuple:
+        return tuple(str(rec.get(c, "") or "") for c in ALL_COLS)
+
+    def _unpushed(self):
+        """(changed ids, deleted ids) relative to what Excel is known to hold."""
+        current = list(self.records.items())
+        changed = {k for k, r in current if self._pushed.get(k) != self._row_tuple(r)}
+        deleted = set(self._pushed) - {k for k, _ in current}
+        return changed, deleted
+
+    def _reload_remote(self) -> None:
+        with self._remote_lock:
+            try:
+                _, remote_rows = self.remote.read_records("request_id")
+            except Exception as exc:
+                self._report_remote(f"Could not read Excel Online: {exc}", True)
+                return
+            changed, deleted = self._unpushed()
+            remote_ids = set()
+            for row in remote_rows:
+                rid = row["request_id"]
+                remote_ids.add(rid)
+                full = {c: row.get(c, "") for c in ALL_COLS}
+                self._pushed[rid] = self._row_tuple(full)
+                if rid in changed or rid in deleted:
+                    continue                       # keep my unpushed edits / deletes
+                self.records[rid] = full
+            # Rows gone from Excel (deleted by someone else) unless I have edits
+            for rid in list(self.records):
+                if rid not in remote_ids and rid not in changed:
+                    del self.records[rid]
+            for rid in list(self._pushed):
+                if rid not in remote_ids:
+                    self._pushed.pop(rid, None)
+            self._remote_synced = True
+            self._write_mirror()
+            self._report_remote("Excel Online: loaded shared data.", False)
+            if changed or deleted:
+                self._push_async()
+
+    def _push_async(self) -> None:
+        with self._flag_lock:
+            self._push_wanted = True
+            if self._worker is not None:
+                return
+            self._worker = threading.Thread(target=self._push_loop, daemon=True)
+            self._worker.start()
+
+    def _push_loop(self) -> None:
+        while True:
+            with self._flag_lock:
+                if not self._push_wanted:
+                    self._worker = None
+                    return
+                self._push_wanted = False
+            try:
+                self._push_now()
+            except Exception as exc:
+                self._report_remote(f"Excel Online push failed: {exc}", True)
+
+    def _push_now(self) -> None:
+        with self._remote_lock:
+            if not self._remote_synced:
+                self._reload_remote()          # never overwrite before first pull
+                if not self._remote_synced:
+                    return
+            changed, deleted = self._unpushed()
+            if not changed and not deleted:
+                return
+            snapshot = {k: dict(self.records[k]) for k in changed if k in self.records}
+            self.remote.sync_records(ALL_COLS, "request_id",
+                                     list(snapshot.values()), deleted)
+            for k, rec in snapshot.items():
+                self._pushed[k] = self._row_tuple(rec)
+            for k in deleted:
+                self._pushed.pop(k, None)
+            self._report_remote("Excel Online: saved.", False)
+
+    def _report_remote(self, msg: str, is_error: bool) -> None:
+        self.remote_error = msg if is_error else ""
+        if self.on_remote_status:
+            try:
+                self.on_remote_status(msg, is_error)
+            except Exception:
+                pass
+
+    def flush_remote(self, timeout: float = 20.0) -> None:
+        """Block until pending Excel Online writes finish (call on exit)."""
+        if self.remote is None:
+            return
+        w = self._worker
+        if w is not None:
+            w.join(timeout)
+        elif self._unpushed() != (set(), set()):
+            try:
+                self._push_now()
+            except Exception as exc:
+                self._report_remote(f"Excel Online push failed: {exc}", True)
+
+    def _write_mirror(self) -> None:
         with open(self.filepath, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(self.records.values())
+            writer.writerows(list(self.records.values()))
+
+    def save(self) -> None:
+        self._write_mirror()
+        if self.remote is not None:
+            self._push_async()
 
     # ── Sync from iLab ────────────────────────────────────────────────────────
 

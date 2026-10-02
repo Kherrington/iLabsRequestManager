@@ -292,9 +292,13 @@ class ILabManagerApp:
         # Resolve relative paths to app directory to avoid duplicate caches
         from pathlib import Path as _Path
         _data_path_obj = _Path(_data_path)
-        if not _data_path_obj.is_absolute():
+        if not _data_path.lower().startswith(("http://", "https://"))                 and not _data_path_obj.is_absolute():
             _data_path = str(_Path(__file__).parent / _data_path)
-        self._data = DataStore(_data_path)
+        self._data = DataStore(
+            _data_path, remote_sheet=str(_p.get("cache_sheet", "") or "Cache"))
+        # Excel Online push/pull results arrive on a worker thread
+        self._data.on_remote_status = lambda msg, err: self.root.after(
+            0, lambda: self._set_status(("⚠ " if err else "") + msg))
         self._client: ILabClient | None = None
         self._current_rec: dict | None = None
         self._sort_col = "created_at"
@@ -2063,6 +2067,7 @@ class ILabManagerApp:
     def _on_close(self) -> None:
         """Save current state to the shared CSV before exiting."""
         self._data.save()
+        self._data.flush_remote()
         self.root.destroy()
 
     def _on_sync(self) -> None:
@@ -3094,7 +3099,7 @@ class PreferencesDialog(tk.Toplevel):
         }
         # Make sure all expected keys exist
         for k, default in [
-            ("data_file",""),
+            ("data_file",""), ("cache_sheet","Cache"),
             ("calm_xlsx",""), ("cvri_xlsx",""),
             ("intro_xlsx",""), ("intro_sheet",""),
             ("class_service_id",""), ("class_price_id",""),

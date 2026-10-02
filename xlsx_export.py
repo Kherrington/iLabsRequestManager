@@ -127,6 +127,74 @@ def _save_workbook(wb, xlsx_path: str) -> None:
         ) from None
 
 
+class _LocalSheet:
+    """openpyxl-backed worksheet (file on disk)."""
+
+    def __init__(self, xlsx_path: str, sheet_name: str, default_title: str):
+        self.path = xlsx_path
+        if Path(xlsx_path).exists():
+            self.wb = openpyxl.load_workbook(xlsx_path)
+            self.ws = (self.wb[sheet_name]
+                       if sheet_name and sheet_name in self.wb.sheetnames
+                       else self.wb.active)
+        else:
+            self.wb = openpyxl.Workbook()
+            self.ws = self.wb.active
+            self.ws.title = sheet_name or default_title
+
+    def headers(self) -> list:
+        # Trim phantom empty columns at the right (formatted Excel files often
+        # have max_column >> actual data columns)
+        raw = [self.ws.cell(1, c).value for c in range(1, self.ws.max_column + 1)]
+        headers = [str(h).strip() if h is not None else "" for h in raw]
+        while headers and not headers[-1]:
+            headers.pop()
+        return headers
+
+    def write_headers(self, headers: list) -> None:
+        _write_headers(self.ws, headers)
+
+    def signatures(self, headers: list) -> set:
+        return _existing_row_signatures(self.ws, headers)
+
+    def append(self, row: list) -> None:
+        self.ws.append(row)
+
+    def save(self) -> None:
+        _save_workbook(self.wb, self.path)
+
+
+class _GraphSheet:
+    """Excel Online worksheet reached through Microsoft Graph (URL target)."""
+
+    def __init__(self, url: str, sheet_name: str, default_title: str):
+        from graph_excel import GraphSheet
+        self.sheet = GraphSheet(url, sheet_name)
+        self._rows = None
+
+    def headers(self) -> list:
+        return self.sheet.headers()
+
+    def write_headers(self, headers: list) -> None:
+        self.sheet.write_rows(1, [headers])
+
+    def signatures(self, headers: list) -> set:
+        return self.sheet.row_signatures(len(headers))
+
+    def append(self, row: list) -> None:
+        self.sheet.append_row(row)
+
+    def save(self) -> None:
+        pass     # each append is already committed
+
+
+def _open_sheet(target: str, sheet_name: str, default_title: str):
+    from graph_excel import is_graph_url
+    if is_graph_url(target):
+        return _GraphSheet(target, sheet_name, default_title)
+    return _LocalSheet(target, sheet_name, default_title)
+
+
 def append_training_row(rec: dict, xlsx_path: str,
                         sheet_name: str = "") -> None:
     """
@@ -159,33 +227,12 @@ def append_training_row(rec: dict, xlsx_path: str,
         )
 
     form_data: dict = json.loads(rec.get("form_data") or "{}")
-    p = Path(xlsx_path)
 
-    # ── Open or create workbook ───────────────────────────────────────────────
-    if p.exists():
-        wb = openpyxl.load_workbook(xlsx_path)
-        # Select sheet by name, fall back to active
-        if sheet_name and sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-        else:
-            ws = wb.active
-
-        # Read headers from row 1, trimming phantom empty columns at the right
-        # (formatted Excel files often have max_column >> actual data columns)
-        raw_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        headers = [str(h).strip() if h is not None else "" for h in raw_headers]
-        # Drop trailing empty headers
-        while headers and not headers[-1]:
-            headers.pop()
-
-        if not headers:
-            _write_headers(ws, DEFAULT_HEADERS)
-            headers = DEFAULT_HEADERS
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_name or "Training Schedule"
-        _write_headers(ws, DEFAULT_HEADERS)
+    # ── Open or create workbook (local file or Excel Online URL) ──────────────
+    sh = _open_sheet(xlsx_path, sheet_name, "Training Schedule")
+    headers = sh.headers()
+    if not headers:
+        sh.write_headers(DEFAULT_HEADERS)
         headers = DEFAULT_HEADERS
 
     # ── Build row matching header order ───────────────────────────────────────
@@ -218,7 +265,7 @@ def append_training_row(rec: dict, xlsx_path: str,
     req_col = next((i for i, h in enumerate(headers)
                     if h and HEADER_MAP.get(_norm(h)) == "request_id"), None)
     req_id_val    = str(rec.get("request_id", "") or "").strip()
-    existing_sigs = _existing_row_signatures(ws, headers)
+    existing_sigs = sh.signatures(headers)
 
     is_dup = False
     if req_col is not None and req_id_val:
@@ -229,8 +276,8 @@ def append_training_row(rec: dict, xlsx_path: str,
     if is_dup:
         return {"headers": headers, "written": {}, "empty": [], "duplicate": True}
 
-    ws.append(row)
-    _save_workbook(wb, xlsx_path)
+    sh.append(row)
+    sh.save()
 
     # Return a summary for debugging / status messages
     mapped   = {h: v for h, v in zip(headers, row) if v not in (None, "")}
@@ -291,27 +338,14 @@ def append_class_session(session: dict, xlsx_path: str,
             "Install it with:  pip install openpyxl"
         )
 
-    p = Path(xlsx_path)
-
-    if p.exists():
-        wb = openpyxl.load_workbook(xlsx_path)
-        ws = wb[sheet_name] if (sheet_name and sheet_name in wb.sheetnames) else wb.active
-        raw_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        headers = [str(h).strip() if h is not None else "" for h in raw_headers]
-        while headers and not headers[-1]:
-            headers.pop()
-        if not headers:
-            _write_headers(ws, CLASS_DEFAULT_HEADERS)
-            headers = CLASS_DEFAULT_HEADERS
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_name or "Intro Course Log"
-        _write_headers(ws, CLASS_DEFAULT_HEADERS)
+    sh = _open_sheet(xlsx_path, sheet_name, "Intro Course Log")
+    headers = sh.headers()
+    if not headers:
+        sh.write_headers(CLASS_DEFAULT_HEADERS)
         headers = CLASS_DEFAULT_HEADERS
 
     students = session.get("students") or []
-    existing_sigs = _existing_row_signatures(ws, headers)
+    existing_sigs = sh.signatures(headers)
     rows_written = 0
     duplicates_skipped = 0
 
@@ -337,10 +371,10 @@ def append_class_session(session: dict, xlsx_path: str,
             duplicates_skipped += 1
             continue
 
-        ws.append(row)
+        sh.append(row)
         existing_sigs.add(row_sig)
         rows_written += 1
 
     if rows_written:
-        _save_workbook(wb, xlsx_path)
+        sh.save()
     return {"rows_written": rows_written, "duplicates_skipped": duplicates_skipped}
