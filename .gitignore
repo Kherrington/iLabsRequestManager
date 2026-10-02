@@ -26,3 +26,12 @@ desktop.ini
 
 # Logs
 *.log
+
+#txt files
+CVRI_welcome.txt
+CVRI-Access.txt
+Common_response.txt
+CALM_welcome.txt
+
+#.csv files
+ilab_requests_cache.csv
