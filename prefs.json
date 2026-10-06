@@ -1,0 +1,16 @@
+{
+  "dark_mode": "0",
+  "data_file": "C:/Users/NIC-ADMIN4/OneDrive - UCSF/Documents - CALM/User Training, Quick Start Guides, Data Analysis/ilab_requests_cache.csv",
+  "cache_sheet": "Cache",
+  "calm_xlsx": "C:/Users/NIC-ADMIN4/OneDrive - UCSF/Documents - CALM/User Training, Quick Start Guides, Data Analysis/Training Schedule_CALM_CURRENT.xlsx",
+  "calm_sheet": "2026",
+  "cvri_xlsx": "C:/Users/NIC-ADMIN4/OneDrive - UCSF/Documents - CALM/User Training, Quick Start Guides, Data Analysis/Training Schedule_CVRI_CURRENT.xlsx",
+  "cvri_sheet": "2026",
+  "intro_xlsx": "C:/Users/NIC-ADMIN4/OneDrive - UCSF/Documents - CALM Organization/Teaching - Intro/Microscope Intro Course Log.xlsx",
+  "intro_sheet": "2026",
+  "class_service_id": "558087",
+  "class_price_id": "2270988",
+  "class_quantity": "2",
+  "class_unit_price": "100",
+  "max_charge": "200"
+}

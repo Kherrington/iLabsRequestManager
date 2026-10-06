@@ -32,7 +32,9 @@ from config import (
     MICROSCOPES, TRAINING_DAYS, CORE_OPTIONS, ACTIVE_STATES,
     COMMON_RESPONSE_IMAGE,
 )
+import tooltip_text as _tt
 from data_store import DataStore
+from tooltips import HoverTip
 from ilabs_client import ILabClient, ILabError
 
 _CS_SESSION_FILE         = Path(__file__).parent / "class_session.json"
@@ -367,16 +369,22 @@ class ILabManagerApp:
         self._sync_indicator.pack_propagate(False)
         self._sync_indicator.pack(side="left", padx=(0, 2), pady=1)
 
-        ttk.Button(bar, text="↻  Sync from iLab",      command=self._on_sync).pack(side="left", padx=2)
-        ttk.Button(bar, text="Clear All Requests",      command=self._on_clear_all).pack(side="left", padx=2)
-        ttk.Button(bar, text="Import iLab Export CSV…", command=self._on_import).pack(side="left", padx=2)
-        ttk.Button(bar, text="Export to CSV…",          command=self._on_export).pack(side="left", padx=2)
-        ttk.Button(bar, text="＋ New Entry",             command=self._on_add_manual_entry).pack(side="left", padx=2)
-        ttk.Button(bar, text="👥 User Permissions",      command=self._on_user_permissions).pack(side="right", padx=2)
-        ttk.Button(bar, text="⚙  Preferences",          command=self._on_open_preferences).pack(side="right", padx=(0, 4))
-        self._dark_btn = ttk.Button(bar, text="🌙 Dark",  command=self._toggle_dark_mode)
-        self._dark_btn.pack(side="right", padx=2)
-        ttk.Button(bar, text="⟳  Sync NON-iLab", command=self._on_sync_cache).pack(side="right", padx=2)
+        def _btn(key, text, cmd, **pack):
+            b = ttk.Button(bar, text=text, command=cmd)
+            b.pack(**pack)
+            HoverTip.static(b, _tt.BUTTONS.get(key, ""), self._tip_theme)
+            return b
+
+        _btn("sync_all",   "⟳  Sync All",             self._on_sync_all,   side="left", padx=2)
+        _btn("sync_ilab",  "↻  Sync iLab",            self._on_sync,       side="left", padx=2)
+        _btn("sync_cache", "⟳  Sync Records & Cache", self._on_sync_cache, side="left", padx=2)
+        _btn("clear_all",  "Clear All Requests",      self._on_clear_all,  side="left", padx=2)
+        _btn("import_csv", "Import iLab Export CSV…", self._on_import,     side="left", padx=2)
+        _btn("export_csv", "Export to CSV…",          self._on_export,     side="left", padx=2)
+        _btn("new_entry",  "＋ New Entry",             self._on_add_manual_entry, side="left", padx=2)
+        _btn("user_permissions", "👥 User Permissions", self._on_user_permissions, side="right", padx=2)
+        _btn("preferences", "⚙  Preferences",         self._on_open_preferences, side="right", padx=(0, 4))
+        self._dark_btn = _btn("dark_mode", "🌙 Dark", self._toggle_dark_mode, side="right", padx=2)
 
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
 
@@ -449,6 +457,14 @@ class ILabManagerApp:
             "class_taken":   ("Class",        46),
         }
 
+        # Merged group-header strip above the column headings
+        self._grp_canvas = tk.Canvas(frame, height=22, highlightthickness=0,
+                                     bg="#f0f0f0")
+        self._grp_canvas.pack(side="top", fill="x")
+        self._grp_canvas.bind("<Configure>", lambda _e: self._draw_group_header())
+        self._grp_colors = {"ilab": "#BBDEFB", "records": "#C8E6C9", "fg": "#000000",
+                            "bg": "#f0f0f0", "border": "#999999"}
+
         self._tree = ttk.Treeview(frame, columns=cols, show="headings",
                                   selectmode="browse")
         for col, (header, width) in headers.items():
@@ -463,7 +479,10 @@ class ILabManagerApp:
 
         vsb = ttk.Scrollbar(frame, orient="vertical",   command=self._tree.yview)
         hsb = ttk.Scrollbar(frame, orient="horizontal", command=self._tree.xview)
-        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        def _xscroll(lo, hi):
+            hsb.set(lo, hi)
+            self._draw_group_header()
+        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=_xscroll)
 
         hsb.pack(side="bottom", fill="x")
         vsb.pack(side="right",  fill="y")
@@ -472,6 +491,67 @@ class ILabManagerApp:
         self._tree.bind("<<TreeviewSelect>>", self._on_row_select)
         self._tree.bind("<ButtonRelease-1>",  self._on_tree_click)
         self._tree.bind("<Double-1>",         self._on_open_in_ilab)
+        # Column widths can be dragged; keep the group header aligned
+        self._tree.bind("<B1-Motion>", lambda _e: self.root.after_idle(self._draw_group_header), add="+")
+        self._tree.bind("<ButtonRelease-1>", lambda _e: self.root.after_idle(self._draw_group_header), add="+")
+
+        HoverTip(self._grp_canvas, self._group_tip_at, self._tip_theme)
+        HoverTip(self._tree, self._tree_tip_at, self._tip_theme)
+        self.root.after_idle(self._draw_group_header)
+
+    _ILAB_COLS = ("request_id", "created_at", "owner_name", "pi_name",
+                  "service_name", "state")
+
+    def _group_spans(self) -> list[tuple[str, str, int, int]]:
+        """[(key, label, x0, x1)] for the iLab and Records groups, in canvas px."""
+        cols = list(self._tree["columns"])
+        widths = {c: int(self._tree.column(c, "width")) for c in cols}
+        offset = round(self._tree.xview()[0] * sum(widths.values()))
+        ilab_w = sum(w for c, w in widths.items() if c in self._ILAB_COLS)
+        rec_w = sum(widths.values()) - ilab_w
+        x = -offset
+        return [("ilab", "iLab data", x, x + ilab_w),
+                ("records", "Records (non-iLab)", x + ilab_w, x + ilab_w + rec_w)]
+
+    def _draw_group_header(self) -> None:
+        c = self._grp_canvas
+        c.delete("all")
+        th = self._grp_colors
+        c.configure(bg=th["bg"])
+        h, vw = c.winfo_height() or 22, c.winfo_width()
+        for key, label, x0, x1 in self._group_spans():
+            c.create_rectangle(x0, 0, x1, h, fill=th[key], outline=th["border"])
+            if x1 > 0 and x0 < vw:
+                c.create_text((max(x0, 0) + min(x1, vw)) / 2, h / 2, text=label,
+                              fill=th["fg"], font=("", 9, "bold"))
+
+    def _group_tip_at(self, event) -> str | None:
+        for key, _label, x0, x1 in self._group_spans():
+            if x0 <= event.x < x1:
+                return _tt.GROUPS.get(key)
+        return None
+
+    def _tree_tip_at(self, event) -> str | None:
+        region = self._tree.identify_region(event.x, event.y)
+        try:
+            col = self._tree["columns"][int(self._tree.identify_column(event.x)[1:]) - 1]
+        except (ValueError, IndexError):
+            return None
+        if region == "heading":
+            return _tt.COLUMNS.get(col)
+        if region == "cell" and col == "state":
+            row = self._tree.identify_row(event.y)
+            if row:
+                return _tt.STATES.get(self._tree.set(row, "state"))
+        return None
+
+    def _tip_theme(self) -> dict:
+        dark = self._dark_mode
+        return {
+            "bg": "#171753" if dark else "#FFFFE1",
+            "fg": "#f8f3e5" if dark else "#000000",
+            "states": STATE_COLORS_DARK if dark else STATE_COLORS,
+        }
 
     # ── Detail panel ─────────────────────────────────────────────────────────
 
@@ -489,6 +569,14 @@ class ILabManagerApp:
         self._build_milestones_tab()
         self._build_training_tab()
         self._build_class_schedule_tab()
+
+        def _tab_tip(event):
+            try:
+                idx = self._notebook.index(f"@{event.x},{event.y}")
+            except tk.TclError:
+                return None
+            return _tt.TABS.get(self._notebook.tab(idx, "text").strip())
+        HoverTip(self._notebook, _tab_tip, self._tip_theme)
 
     # ── Quick-actions bar (milestone buttons, always visible) ─────────────────
 
@@ -2058,6 +2146,11 @@ class ILabManagerApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_sync_all(self) -> None:
+        """Reload the shared records cache, then sync from iLab."""
+        self._on_sync_cache()
+        self._on_sync()
+
     def _on_sync_cache(self) -> None:
         """Reload the shared CSV from disk to pick up changes from other machines."""
         self._data.reload()
@@ -2821,6 +2914,13 @@ class ILabManagerApp:
 
         # Root window and bare tk widgets
         self.root.configure(bg=bg)
+
+        self._grp_colors = {
+            "ilab":    "#1A4F7A" if dark else "#BBDEFB",
+            "records": "#1F5A2B" if dark else "#C8E6C9",
+            "fg": sel_fg if dark else fg, "bg": bg, "border": border,
+        }
+        self._draw_group_header()
 
         if hasattr(self, "_qa_canvas"):
             self._qa_canvas.configure(bg=bg, highlightthickness=0)

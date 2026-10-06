@@ -1,0 +1,146 @@
+[
+  {
+    "date": "2026-07-07",
+    "instructor": "Kari",
+    "time": "3pm",
+    "location": "GH 261",
+    "students": [
+      {
+        "name": "Yanchang Bian",
+        "pi": "Dengke Ma"
+      },
+      {
+        "name": "Ei Fukumoto",
+        "pi": "Julius, David (UCSF) Lab"
+      },
+      {
+        "name": "Kassandra Romo",
+        "pi": "Alexandra Nelson"
+      }
+    ]
+  },
+  {
+    "date": "2026-07-13",
+    "instructor": "Julia Martin",
+    "time": "10:30am",
+    "location": "S271",
+    "students": [
+      {
+        "name": "Angelina Guo",
+        "pi": "Mark Vonzastrow"
+      },
+      {
+        "name": "Valencia Fernandes",
+        "pi": "LAKKARAJU, APARNA (UCSF) Lab"
+      },
+      {
+        "name": "Abdallah Hussien",
+        "pi": "Pearce, David (UCSF) Lab"
+      }
+    ]
+  },
+  {
+    "date": "2026-07-23",
+    "instructor": "Julia Martin",
+    "time": "1pm",
+    "location": "",
+    "students": [
+      {
+        "name": "Teerithveen Pasricha",
+        "pi": "Liu, John  (UCSF) Lab"
+      },
+      {
+        "name": "Shamik Mascharak",
+        "pi": "Sheppard, Dean (UCSF) Lab"
+      },
+      {
+        "name": "Wonhee Lee",
+        "pi": "Gartner, Zev (UCSF) Lab"
+      },
+      {
+        "name": "Tyler Edwards",
+        "pi": "Alan Baik"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-11",
+    "instructor": "Kari Herrington",
+    "time": "2pm",
+    "location": "261",
+    "students": [
+      {
+        "name": "Yina Hudnall",
+        "pi": "Marshall, Wallace (UCSF) Lab"
+      },
+      {
+        "name": "Bingyan Li",
+        "pi": "Weiss, William (UCSF) Lab"
+      },
+      {
+        "name": "Alexander Yurochko",
+        "pi": "Martens, Hanna (UCSF) Lab"
+      },
+      {
+        "name": "Madeleine Chong",
+        "pi": "Martens, Hanna (UCSF) Lab"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-19",
+    "instructor": "Kari Herrington",
+    "time": "2pm",
+    "location": "261",
+    "students": [
+      {
+        "name": "Lingling Zhang",
+        "pi": "Jia, Bill (UCSF) Lab"
+      },
+      {
+        "name": "Emma Abbate",
+        "pi": "Lang, Di (UCSF) Lab"
+      },
+      {
+        "name": "Yujun Xu",
+        "pi": "Baik, Alan (UCSF) Lab"
+      }
+    ]
+  },
+  {
+    "date": "2026-09-15",
+    "instructor": "Kari Herrington",
+    "time": "2pm",
+    "location": "S271",
+    "students": [
+      {
+        "name": "Arren Chavez Ramsey",
+        "pi": "Pleasure, Sam (UCSF) Lab"
+      },
+      {
+        "name": "Yunhan Jiang",
+        "pi": "Ashworth, Alan (UCSF) Lab"
+      }
+    ]
+  },
+  {
+    "date": "2026-09-22",
+    "instructor": "",
+    "time": "",
+    "location": "",
+    "students": [
+      {
+        "name": "Eliza Rhee",
+        "pi": "Nelson, Alexandra (UCSF) Lab"
+      },
+      {
+        "name": "Sang Ah Kim",
+        "pi": "Kortemme, Tanja (UCSF) Lab"
+      },
+      {
+        "name": "Elsa Dean-Muncie",
+        "pi": "Nelson, Alexandra (UCSF) Lab"
+      }
+    ]
+  }
+]
