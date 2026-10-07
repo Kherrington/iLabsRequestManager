@@ -26,7 +26,8 @@ except ImportError:
 
 import prefs as _prefs
 from calendar_widget import CalendarPicker
-from xlsx_export import append_training_row, append_class_session, HAS_OPENPYXL
+from xlsx_export import (append_training_row, append_class_session,
+                         read_class_sessions, HAS_OPENPYXL)
 from config import (
     CORE_ID, ILAB_BASE_URL, DATA_FILE, TEAM_MEMBERS, LABELS,
     MICROSCOPES, TRAINING_DAYS, CORE_OPTIONS, ACTIVE_STATES,
@@ -37,12 +38,12 @@ from data_store import DataStore
 from tooltips import HoverTip
 from ilabs_client import ILabClient, ILabError
 
-_CS_SESSION_FILE         = Path(__file__).parent / "class_session.json"
-_CALM_WELCOME_FILE       = Path(__file__).parent / "CALM_welcome.txt"
-_CVRI_WELCOME_FILE       = Path(__file__).parent / "CVRI_welcome.txt"
-_COMMON_RESPONSE_FILE    = Path(__file__).parent / "Common_response.txt"
-_COMMON_RESPONSE_IMG_FILE = Path(__file__).parent / "Common_response_image.txt"
-_CVRI_ACCESS_FILE        = Path(__file__).parent / "CVRI-Access.txt"
+_APP_DIR                 = _prefs.APP_DIR
+_CALM_WELCOME_FILE       = _APP_DIR / "CALM_welcome.txt"
+_CVRI_WELCOME_FILE       = _APP_DIR / "CVRI_welcome.txt"
+_COMMON_RESPONSE_FILE    = _APP_DIR / "Common_response.txt"
+_COMMON_RESPONSE_IMG_FILE = _APP_DIR / "Common_response_image.txt"
+_CVRI_ACCESS_FILE        = _APP_DIR / "CVRI-Access.txt"
 
 # ── Email-template markup parser ──────────────────────────────────────────────
 # Supports: **bold**   *italic*   __underline__
@@ -257,6 +258,29 @@ STATE_COLORS_DARK = {
 }
 
 
+def _class_session_path(data_path: str) -> Path:
+    """Absolute path of class_session.json.
+
+    Uses the class_session_file preference if set; otherwise the folder that
+    holds the shared cache CSV (so class sessions sync between machines along
+    with the records).  An existing app-folder copy is copied across once.
+    """
+    custom = _prefs.abs_path(_prefs.get_prefs().get("class_session_file", ""))
+    if custom:
+        return Path(custom)
+    legacy = _APP_DIR / "class_session.json"
+    if data_path.lower().startswith(("http://", "https://")):
+        return legacy
+    target = Path(data_path).parent / "class_session.json"
+    if target != legacy and not target.exists() and legacy.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(legacy.read_text(encoding="utf-8"), encoding="utf-8")
+        except OSError:
+            return legacy
+    return target
+
+
 def _lighten_hex(hex_color: str, factor: float = 0.4) -> str:
     """Return hex_color blended factor% toward white."""
     h = hex_color.lstrip("#")
@@ -290,12 +314,10 @@ class ILabManagerApp:
         self.root.minsize(900, 600)
 
         _p = _prefs.get_prefs()
-        _data_path = str(_p.get("data_file", "") or "").strip() or DATA_FILE
-        # Resolve relative paths to app directory to avoid duplicate caches
-        from pathlib import Path as _Path
-        _data_path_obj = _Path(_data_path)
-        if not _data_path.lower().startswith(("http://", "https://"))                 and not _data_path_obj.is_absolute():
-            _data_path = str(_Path(__file__).parent / _data_path)
+        # Always an absolute path (relative values resolve against the app
+        # directory) so the same cache is used wherever the app is launched from
+        _data_path = _prefs.abs_path(_p.get("data_file", "") or DATA_FILE)
+        self._cs_file = _class_session_path(_data_path)
         self._data = DataStore(
             _data_path, remote_sheet=str(_p.get("cache_sheet", "") or "Cache"))
         # Excel Online push/pull results arrive on a worker thread
@@ -311,6 +333,9 @@ class ILabManagerApp:
 
         self._dark_mode = False
         self._autosave_job: str | None = None
+        self._idle_sync_job: str | None = None
+        self._periodic_jobs: dict[str, str] = {}
+        self._ilab_syncing = False
 
         self._build_ui()
         self._data.reload()          # pick up any changes written by other machines
@@ -336,6 +361,9 @@ class ILabManagerApp:
         for _var in (self._cs_date_var, self._cs_instructor_var,
                      self._cs_time_var, self._cs_location_var):
             _var.trace_add("write", self._schedule_autosave)
+
+        self._start_auto_sync()
+        self.root.after(1500, self._sync_on_open)
 
         # Apply saved theme after UI is fully built
         _dark_pref = str(_p.get("dark_mode", "0")).strip() == "1"
@@ -821,7 +849,7 @@ class ILabManagerApp:
             if not img_filename:
                 self._set_status("No image configured.")
                 return
-            img_path = Path(__file__).parent / img_filename
+            img_path = _APP_DIR / img_filename
             if not img_path.exists():
                 self._set_status(f"Image file not found: {img_path}")
                 return
@@ -1127,7 +1155,11 @@ class ILabManagerApp:
         top_row = ttk.Frame(left)
         top_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Button(top_row, text="Export to Records →",
-                   command=self._on_export_to_schedule).pack(side="left", padx=(0, 10))
+                   command=self._on_export_to_schedule).pack(side="left", padx=(0, 6))
+        _sync_sheet = ttk.Button(top_row, text="⟳ Sync Class Sheet",
+                                 command=self._cs_sync_all)
+        _sync_sheet.pack(side="left", padx=(0, 10))
+        HoverTip.static(_sync_sheet, _tt.BUTTONS.get("sync_classes", ""), self._tip_theme)
         self._exported_lbl = ttk.Label(top_row, text="", foreground="#2E7D32")
         self._exported_lbl.pack(side="left")
 
@@ -1259,8 +1291,10 @@ class ILabManagerApp:
         self._cs_sess_tree = ttk.Treeview(
             sess_frame, columns=("date", "instructor"),
             show="headings", selectmode="browse", height=14)
-        self._cs_sess_tree.heading("date",       text="Date")
-        self._cs_sess_tree.heading("instructor", text="Instructor")
+        self._cs_sess_tree.heading("date",       text="Date",
+                                   command=lambda: self._cs_sort("sess", "date"))
+        self._cs_sess_tree.heading("instructor", text="Instructor",
+                                   command=lambda: self._cs_sort("sess", "instructor"))
         self._cs_sess_tree.column("date",        width=90,  minwidth=70)
         self._cs_sess_tree.column("instructor",  width=110, minwidth=70)
         self._cs_sess_tree.bind("<<TreeviewSelect>>", self._cs_on_session_select)
@@ -1284,6 +1318,12 @@ class ILabManagerApp:
                    command=self._cs_export).pack(anchor="w")
         self._cs_export_lbl = ttk.Label(left, text="", foreground="#2E7D32")
         self._cs_export_lbl.pack(anchor="w", pady=(2, 0))
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=8)
+        _sync_cls = ttk.Button(left, text="⟳  Sync All Classes",
+                               command=self._cs_sync_all)
+        _sync_cls.pack(anchor="w")
+        HoverTip.static(_sync_cls, _tt.BUTTONS.get("sync_classes", ""), self._tip_theme)
 
         # ── Right: session detail (info + students) ───────────────────────────
         right = ttk.Frame(paned, padding=(6, 0, 0, 0))
@@ -1329,8 +1369,10 @@ class ILabManagerApp:
         self._cs_tree = ttk.Treeview(
             stu_frame, columns=("name", "pi"),
             show="headings", selectmode="browse", height=8)
-        self._cs_tree.heading("name", text="Student Name")
-        self._cs_tree.heading("pi",   text="PI / Lab")
+        self._cs_tree.heading("name", text="Student Name",
+                              command=lambda: self._cs_sort("stu", "name"))
+        self._cs_tree.heading("pi",   text="PI / Lab",
+                              command=lambda: self._cs_sort("stu", "pi"))
         self._cs_tree.column("name", width=210, minwidth=100)
         self._cs_tree.column("pi",   width=190, minwidth=80)
         self._cs_tree.bind("<Double-1>", self._cs_edit_student)
@@ -1357,7 +1399,7 @@ class ILabManagerApp:
     def _cs_load(self) -> None:
         """Load all sessions from JSON and populate the sessions list."""
         try:
-            raw = json.loads(_CS_SESSION_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(self._cs_file.read_text(encoding="utf-8"))
             # Support old single-session format (dict) and new list format
             if isinstance(raw, dict):
                 raw = [raw]
@@ -1366,10 +1408,72 @@ class ILabManagerApp:
             self._cs_sessions = []
         self._cs_refresh_sessions_tree()
 
+    def _cs_pull_from_log(self) -> str:
+        """Merge sessions/students from the Microscope Intro Course Log xlsx
+        (prefs intro_xlsx) into the local sessions.  Never removes anything
+        locally.  Returns a short status fragment."""
+        p = _prefs.get_prefs()
+        xlsx_path = _prefs.abs_path(p.get("intro_xlsx", ""))
+        if not xlsx_path:
+            return "Intro log path not set"
+        if not HAS_OPENPYXL:
+            return "Intro log skipped (openpyxl missing)"
+        try:
+            log_sessions = read_class_sessions(
+                xlsx_path, str(p.get("intro_sheet", "") or "").strip())
+        except Exception as exc:
+            return f"Intro log not read ({exc})"
+
+        def _key(s):
+            return (s.get("date", ""), s.get("instructor", "").strip().lower())
+        local = {_key(s): s for s in self._cs_sessions}
+        added_sess = added_stu = 0
+        for ls in log_sessions:
+            cur = local.get(_key(ls))
+            if cur is None:
+                # Skip students already listed locally that day (the
+                # instructor may just be spelled differently)
+                known = {(x.get("date", ""), st.get("name", "").strip().lower())
+                         for x in self._cs_sessions for st in x.get("students", [])}
+                ls["students"] = [st for st in ls["students"]
+                                  if (ls["date"], st["name"].strip().lower()) not in known]
+                if not ls["students"]:
+                    continue
+                self._cs_sessions.append(ls)
+                local[_key(ls)] = ls
+                added_sess += 1
+                added_stu += len(ls["students"])
+                continue
+            for fld in ("time", "location"):
+                if not cur.get(fld) and ls.get(fld):
+                    cur[fld] = ls[fld]
+            have = {s.get("name", "").strip().lower()
+                    for s in cur.setdefault("students", [])}
+            for stu in ls["students"]:
+                if stu["name"].strip().lower() not in have:
+                    cur["students"].append(stu)
+                    have.add(stu["name"].strip().lower())
+                    added_stu += 1
+        if added_sess or added_stu:
+            self._cs_persist()
+        return f"Intro log: {added_sess} new session(s), {added_stu} new student(s)"
+
+    def _cs_reload(self) -> str:
+        """Re-read class sessions from disk and the Intro Course Log,
+        keeping the selected session.  Returns a status fragment."""
+        idx = self._cs_sel_idx
+        self._cs_load()
+        note = self._cs_pull_from_log()
+        self._cs_refresh_sessions_tree()
+        self._cs_sel_idx = None
+        if idx is not None and idx < len(self._cs_sessions):
+            self._cs_sess_tree.selection_set(str(idx))
+        return note
+
     def _cs_persist(self) -> None:
         """Write all sessions to JSON."""
         try:
-            _CS_SESSION_FILE.write_text(
+            self._cs_file.write_text(
                 json.dumps(self._cs_sessions, indent=2, ensure_ascii=False),
                 encoding="utf-8")
         except Exception as exc:
@@ -1570,13 +1674,95 @@ class ILabManagerApp:
             self._cs_refresh_sessions_tree()
             self._cs_sess_tree.selection_set(sel_iid)
 
+    def _cs_sort(self, which: str, col: str) -> None:
+        """Click a heading: sort ascending, click again for descending."""
+        state = self.__dict__.setdefault("_cs_sort_state", {})
+        rev = not state[(which, col)] if (which, col) in state else False
+        state.clear()
+        state[(which, col)] = rev
+
+        if which == "sess":
+            sel = (self._cs_sessions[self._cs_sel_idx]
+                   if self._cs_sel_idx is not None else None)
+            self._cs_sessions.sort(key=lambda s: (s.get(col, "") or "").lower(),
+                                   reverse=rev)
+            self._cs_refresh_sessions_tree()
+            self._cs_sel_idx = None
+            if sel is not None:
+                self._cs_sess_tree.selection_set(
+                    str(next(i for i, s in enumerate(self._cs_sessions) if s is sel)))
+            tree, heads = self._cs_sess_tree, {"date": "Date", "instructor": "Instructor"}
+        else:
+            if self._cs_sel_idx is None:
+                return
+            studs = self._cs_sessions[self._cs_sel_idx].setdefault("students", [])
+            studs.sort(key=lambda s: (s.get(col, "") or "").lower(), reverse=rev)
+            self._cs_refresh_students_tree()
+            tree, heads = self._cs_tree, {"name": "Student Name", "pi": "PI / Lab"}
+        for c, text in heads.items():
+            arrow = (" ▼" if rev else " ▲") if c == col else ""
+            tree.heading(c, text=text + arrow)
+        self._cs_persist()
+
+    def _cs_full_sync(self, silent: bool) -> str:
+        """Two-way sync of every class session with the Intro Course Log:
+        reload the local file, pull what the log has, then append any local
+        students the log lacks.  Returns a status fragment; with silent=True
+        problems are reported in that fragment instead of dialogs."""
+        p = _prefs.get_prefs()
+        xlsx_path = _prefs.abs_path(p.get("intro_xlsx", ""))
+        if not xlsx_path:
+            if not silent:
+                messagebox.showwarning(
+                    "xlsx Path Not Set",
+                    "Set the Microscope Intro Course Log path in ⚙ Preferences.")
+            return "Intro log path not set"
+        if not HAS_OPENPYXL:
+            if not silent:
+                messagebox.showerror("openpyxl Required",
+                                     "Install openpyxl:  pip install openpyxl")
+            return "Intro log skipped (openpyxl missing)"
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+            self._do_autosave()
+        sheet = str(p.get("intro_sheet", "") or "").strip()
+        pull_note = self._cs_reload()
+        try:
+            in_log = {(s["date"], st["name"].strip().lower())
+                      for s in read_class_sessions(xlsx_path, sheet)
+                      for st in s["students"]}
+            pushed = 0
+            for sess in self._cs_sessions:
+                new = [st for st in sess.get("students", [])
+                       if (sess.get("date", ""), st.get("name", "").strip().lower())
+                       not in in_log]
+                if not new or not sess.get("date"):
+                    continue
+                part = {**sess, "students": new}
+                ok, res = self._run_export_with_retry(
+                    lambda part=part: append_class_session(
+                        part, xlsx_path, sheet_name=sheet), silent=silent)
+                if not ok:
+                    return f"{pull_note}; push to log skipped (file in use)"
+                pushed += res.get("rows_written", 0)
+        except Exception as exc:
+            if not silent:
+                messagebox.showerror("Class Sync Error", str(exc))
+            return f"{pull_note}; push to log failed ({exc})"
+        return f"{pull_note}; {pushed} student row(s) added to the log"
+
+    def _cs_sync_all(self) -> None:
+        msg = self._cs_full_sync(silent=False)
+        self._cs_export_lbl.config(text=f"✓ {msg}")
+        self._set_status(f"Classes synced — {msg}.")
+
     def _cs_export(self) -> None:
         if self._cs_sel_idx is None:
             messagebox.showwarning("No Session Selected",
                                    "Select a session to export.")
             return
         p = _prefs.get_prefs()
-        xlsx_path = str(p.get("intro_xlsx", "") or "").strip()
+        xlsx_path = _prefs.abs_path(p.get("intro_xlsx", ""))
         if not xlsx_path:
             messagebox.showwarning(
                 "xlsx Path Not Set",
@@ -2146,16 +2332,29 @@ class ILabManagerApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_sync_all(self) -> None:
-        """Reload the shared records cache, then sync from iLab."""
-        self._on_sync_cache()
-        self._on_sync()
+    def _on_sync_all(self, auto: bool = False) -> None:
+        """Sync records & cache first, then iLab."""
+        self._on_sync_cache(auto=auto)
+        self._on_sync(auto=auto)
 
-    def _on_sync_cache(self) -> None:
-        """Reload the shared CSV from disk to pick up changes from other machines."""
+    def _on_sync_cache(self, auto: bool = False) -> None:
+        """Sync every non-iLab column plus the class sessions with disk.
+
+        Pending edits are saved first, then the shared CSV and the class
+        session file are re-read so changes from other machines appear.
+        """
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+            self._do_autosave()
+        sel = self._tree.selection()
         self._data.reload()
+        cs_note = self._cs_full_sync(silent=True)
         self._refresh_table()
-        self._set_status("Cache reloaded from disk.")
+        if sel and self._tree.exists(sel[0]):
+            self._tree.selection_set(sel[0])
+        when = datetime.now().strftime("%I:%M %p")
+        self._set_status(f"Records, cache and class sessions synced"
+                         f"{' (auto)' if auto else ''} at {when}. {cs_note}.")
 
     def _on_close(self) -> None:
         """Save current state to the shared CSV before exiting."""
@@ -2163,12 +2362,26 @@ class ILabManagerApp:
         self._data.flush_remote()
         self.root.destroy()
 
-    def _on_sync(self) -> None:
+    def _on_sync(self, auto: bool = False) -> None:
+        if self._ilab_syncing:
+            return
+        if auto and not self._core_id_var.get().strip():
+            self._set_status("Auto-sync skipped: no Core ID set.")
+            return
         core_id = self._get_core_id()
         if core_id is None:
             return
+        self._ilab_syncing = True
         self._set_status("Syncing with iLab…")
         self._set_sync_indicator("working")
+
+        def _fail(msg: str, title: str) -> None:
+            self._ilab_syncing = False
+            self._set_sync_indicator("error")
+            if auto:
+                self._set_status(f"Auto iLab sync failed: {msg.splitlines()[0]}")
+            else:
+                messagebox.showerror(title, msg)
 
         def worker():
             try:
@@ -2179,6 +2392,7 @@ class ILabManagerApp:
                     states=ACTIVE_STATES,
                 )
                 when = datetime.now().strftime("%b %d  %I:%M %p")
+                self.root.after(0, lambda: setattr(self, "_ilab_syncing", False))
                 self.root.after(0, lambda: self._set_sync_indicator("ok"))
                 self.root.after(0, lambda: self._set_status(
                     f"Sync complete — {count} active request(s) loaded."))
@@ -2197,11 +2411,9 @@ class ILabManagerApp:
                         "  2. Or check Administration → API Clients in iLab for the URL.\n"
                         "  3. Then update ILAB_BASE_URL in config.py and restart."
                     )
-                self.root.after(0, lambda: self._set_sync_indicator("error"))
-                self.root.after(0, lambda e=msg: messagebox.showerror("iLab API Error", e))
+                self.root.after(0, lambda e=msg: _fail(e, "iLab API Error"))
             except Exception as exc:
-                self.root.after(0, lambda: self._set_sync_indicator("error"))
-                self.root.after(0, lambda e=exc: messagebox.showerror("Sync Error", str(e)))
+                self.root.after(0, lambda e=exc: _fail(str(e), "Sync Error"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2540,7 +2752,7 @@ class ILabManagerApp:
             return False
 
         p = _prefs.get_prefs()
-        xlsx_path = str(p.get(f"{core.lower()}_xlsx", "") or "").strip()
+        xlsx_path = _prefs.abs_path(p.get(f"{core.lower()}_xlsx", ""))
         if not xlsx_path:
             if not silent:
                 messagebox.showwarning(
@@ -2807,7 +3019,9 @@ class ILabManagerApp:
         dlg.geometry(f"+{max(0, px)}+{max(0, py)}")
 
     def _on_open_preferences(self) -> None:
-        PreferencesDialog(self.root, dark=self._dark_mode)
+        dlg = PreferencesDialog(self.root, dark=self._dark_mode)
+        self.root.wait_window(dlg)
+        self._start_auto_sync()
 
     def _on_open_in_ilab(self, _event=None) -> None:
         if not self._current_rec:
@@ -2993,6 +3207,45 @@ class ILabManagerApp:
             self.root.after_cancel(self._autosave_job)
         self._autosave_job = self.root.after(5_000, self._do_autosave)
         self._autosave_status_var.set("● unsaved")
+        self._schedule_idle_sync()
+
+    # ── Auto-sync ─────────────────────────────────────────────────────────────
+
+    def _schedule_idle_sync(self) -> None:
+        """Records sync N minutes after the last edit (idle_sync_minutes)."""
+        if self._idle_sync_job:
+            self.root.after_cancel(self._idle_sync_job)
+            self._idle_sync_job = None
+        mins = _prefs.minutes("idle_sync_minutes")
+        if mins:
+            self._idle_sync_job = self.root.after(
+                mins * 60_000, self._idle_sync_fire)
+
+    def _idle_sync_fire(self) -> None:
+        self._idle_sync_job = None
+        self._on_sync_cache(auto=True)
+
+    def _start_auto_sync(self) -> None:
+        """(Re)start the periodic syncs from the current preferences."""
+        for job in self._periodic_jobs.values():
+            self.root.after_cancel(job)
+        self._periodic_jobs.clear()
+        self._arm_periodic("records_sync_minutes", self._on_sync_cache)
+        self._arm_periodic("ilab_sync_minutes", self._on_sync)
+
+    def _arm_periodic(self, key: str, fn) -> None:
+        mins = _prefs.minutes(key)
+        if not mins:
+            return
+
+        def _tick():
+            fn(auto=True)
+            self._arm_periodic(key, fn)
+        self._periodic_jobs[key] = self.root.after(mins * 60_000, _tick)
+
+    def _sync_on_open(self) -> None:
+        if str(_prefs.get_prefs().get("sync_on_open", "1")).strip() == "1":
+            self._on_sync_all(auto=True)
 
     def _do_autosave(self) -> None:
         """Flush all pending UI edits and save to disk."""
@@ -3204,11 +3457,16 @@ class PreferencesDialog(tk.Toplevel):
             ("intro_xlsx",""), ("intro_sheet",""),
             ("class_service_id",""), ("class_price_id",""),
             ("class_quantity","2"), ("class_unit_price","100"),
+            ("sync_on_open","1"), ("idle_sync_minutes","5"),
+            ("records_sync_minutes","60"), ("ilab_sync_minutes","60"),
+            ("class_session_file",""),
         ]:
             if k not in self._vars:
                 self._vars[k] = tk.StringVar(value=default)
 
         self._original_data_file = self._vars["data_file"].get()
+        self._open_var = tk.BooleanVar(
+            value=self._vars["sync_on_open"].get().strip() == "1")
 
         PAD = dict(padx=8, pady=4)
 
@@ -3332,9 +3590,35 @@ class PreferencesDialog(tk.Toplevel):
         ttk.Separator(self, orient="horizontal").grid(
             row=23, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
 
+        # ── Section: auto sync ────────────────────────────────────────────────
+        ttk.Label(self, text="Auto Sync", font=("", 10, "bold")).grid(
+            row=24, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            self, text="Sync All shortly after the app opens",
+            variable=self._open_var,
+        ).grid(row=25, column=1, columnspan=3, sticky="w", **PAD)
+        for i, (label, key) in enumerate([
+            ("After last edit (min):",       "idle_sync_minutes"),
+            ("Records & Cache every (min):", "records_sync_minutes"),
+            ("iLab every (min):",            "ilab_sync_minutes"),
+        ], start=26):
+            ttk.Label(self, text=label, anchor="e").grid(
+                row=i, column=0, sticky="e", **PAD)
+            ttk.Entry(self, textvariable=self._vars[key], width=8).grid(
+                row=i, column=1, sticky="w", **PAD)
+        ttk.Label(
+            self,
+            text="Minutes between automatic syncs; 0 turns that one off.\n"
+                 "Auto iLab sync needs a Core ID and fails quietly (status bar).",
+            foreground=self._fg2,
+        ).grid(row=29, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 6))
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=30, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
+
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(self, padding=(8, 4, 12, 10))
-        btn_row.grid(row=24, column=0, columnspan=4, sticky="e")
+        btn_row.grid(row=31, column=0, columnspan=4, sticky="e")
         ttk.Button(btn_row, text="Save", command=self._save,
                    width=10).pack(side="right", padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy,
@@ -3369,6 +3653,16 @@ class PreferencesDialog(tk.Toplevel):
             self._vars[key].set(path)
 
     def _save(self) -> None:
+        self._vars["sync_on_open"].set("1" if self._open_var.get() else "0")
+        # Store file locations as absolute paths
+        for key in ("data_file", "calm_xlsx", "cvri_xlsx", "intro_xlsx",
+                    "class_session_file"):
+            self._vars[key].set(_prefs.abs_path(self._vars[key].get()))
+        for key in ("idle_sync_minutes", "records_sync_minutes", "ilab_sync_minutes"):
+            try:
+                self._vars[key].set(str(max(0, int(float(self._vars[key].get() or 0)))))
+            except ValueError:
+                self._vars[key].set("0")
         new_data_file = self._vars["data_file"].get().strip()
         _prefs.save_prefs({k: v.get() for k, v in self._vars.items()})
         self.destroy()

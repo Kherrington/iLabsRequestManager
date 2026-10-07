@@ -90,7 +90,7 @@ class DataStore:
         self.remote = None
         if is_graph_url(str(filepath)):
             self.remote = GraphSheet(str(filepath), remote_sheet or "Cache")
-            filepath = Path(__file__).parent / "ilab_requests_cache_mirror.csv"
+            filepath = Path(__file__).resolve().parent / "ilab_requests_cache_mirror.csv"
         self.filepath = Path(filepath)
         self.records: Dict[str, dict] = {}
         self.on_change: Optional[Callable[[], None]] = None  # set by app for auto-save

@@ -13,32 +13,73 @@ Usage:
 
 import csv
 import json
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 
+ALL_COLS = [
+    "request_id", "name", "state", "created_at",
+    "start_on", "end_on", "completed_on",
+    "owner_name", "owner_email", "pi_name", "pi_email",
+    "service_name", "last_synced",
+    "assigned_to", "labels", "local_notes",
+    "core_lab", "microscope",
+    "training_date", "training_time", "training_day",
+    "class_taken",
+    "wf_laser_safety",
+    "wf_emailed", "wf_class_scheduled", "wf_not_required",
+    "wf_training_scheduled",
+    "wf_post_email", "wf_post_listserve",
+    "wf_post_approved", "wf_post_confirmed",
+    "schedule_exported", "local_only",
+    "form_data", "milestones_data",
+]
+
+BACKUP_DIR_NAME = "cache_conflict_backup"
+
+
+def _prefs_data_file() -> Optional[Path]:
+    """The cache path configured in prefs.json (data_file), if any."""
+    try:
+        with open(Path(__file__).resolve().parent / "prefs.json", encoding="utf-8") as fh:
+            p = json.load(fh).get("data_file", "")
+        return Path(p) if p and not p.lower().startswith("http") else None
+    except Exception:
+        return None
+
+
+def is_cache_name(name: str) -> bool:
+    """ilab_requests_cache.csv plus OneDrive conflict copies such as
+    ilab_requests_cache-NIC-6D-2-10.csv (but not .backup / _mirror files)."""
+    return bool(re.fullmatch(r"ilab_requests_cache(-.+)?\.csv", name))
+
+
 def find_cache_files(search_paths: Optional[List[Path]] = None) -> List[Path]:
-    """Find all ilab_requests_cache.csv files in the given paths."""
+    """Find the cache file and all its conflict copies in the given paths."""
     if search_paths is None:
-        # Default: search user's home, OneDrive, Desktop, Documents
         search_paths = [
-            Path.home(),
+            Path(__file__).resolve().parent,
             Path.home() / "OneDrive - UCSF",
             Path.home() / "Documents",
             Path.home() / "Desktop",
-            Path.home() / "Workspace",
         ]
+        target = _prefs_data_file()
+        if target is not None:
+            search_paths.append(target.parent)
 
-    found = []
+    found = set()
     for base in search_paths:
         if not base.exists():
             continue
-        for cache_file in base.rglob("ilab_requests_cache.csv"):
-            if cache_file.is_file():
-                found.append(cache_file)
-
-    return sorted(set(found))
+        for f in base.rglob("ilab_requests_cache*.csv"):
+            if (f.is_file() and is_cache_name(f.name)
+                    and BACKUP_DIR_NAME not in f.parts
+                    and "__pycache__" not in f.parts):
+                found.add(f)
+    return sorted(found)
 
 
 def load_cache_records(filepath: Path) -> Dict[str, dict]:
@@ -54,37 +95,30 @@ def load_cache_records(filepath: Path) -> Dict[str, dict]:
     return records
 
 
-def merge_records(all_records: Dict[str, Dict[str, dict]]) -> Dict[str, dict]:
-    """
-    Merge records from multiple cache files, preferring newest last_synced time.
+def _sync_key(cache_path: Path, record: dict):
+    """Sort key: newest last_synced wins; file mtime breaks ties."""
+    t = record.get("last_synced", "")
+    if t in ("", "manual"):
+        t = "0"
+    try:
+        mtime = cache_path.stat().st_mtime
+    except OSError:
+        mtime = 0
+    return (t, mtime)
 
-    Returns a dict of request_id -> record (with the newest version of each request).
-    """
-    merged = {}
+
+def merge_records(all_records: Dict[Path, Dict[str, dict]],
+                  preferred: Optional[Path] = None) -> Dict[str, dict]:
+    """Merge records from many cache files; newest last_synced wins per
+    request_id (ties: *preferred* file, then newest file mtime)."""
+    merged: Dict[str, dict] = {}
+    best: Dict[str, tuple] = {}
     for cache_path, records in all_records.items():
         for req_id, record in records.items():
-            existing = merged.get(req_id)
-            if existing is None:
-                record["_source"] = str(cache_path)
+            key = _sync_key(cache_path, record) + (cache_path == preferred,)
+            if req_id not in best or key > best[req_id]:
+                best[req_id] = key
                 merged[req_id] = record
-            else:
-                # Prefer the record with the most recent last_synced time
-                existing_time = existing.get("last_synced", "")
-                new_time = record.get("last_synced", "")
-
-                # Handle "manual" or empty timestamps
-                if existing_time in ("", "manual"):
-                    existing_time = "0"
-                if new_time in ("", "manual"):
-                    new_time = "0"
-
-                try:
-                    if new_time > existing_time:
-                        record["_source"] = str(cache_path)
-                        merged[req_id] = record
-                except TypeError:
-                    pass  # if timestamps can't be compared, keep existing
-
     return merged
 
 
@@ -118,134 +152,72 @@ def print_summary(cache_files: List[Path], all_records: Dict[str, Dict[str, dict
     print(f"{'='*80}\n")
 
 
-def consolidate_interactive() -> None:
-    """Interactive consolidation process."""
-    print("\n🔍 Scanning for cache files...")
+def consolidate_interactive(argv: Optional[List[str]] = None) -> None:
+    """Merge every cache file / conflict copy into the prefs.json data_file."""
+    argv = argv or []
+    dry_run = "--dry-run" in argv
+    assume_yes = "--yes" in argv
+
+    target_file = _prefs_data_file() or (Path(__file__).resolve().parent / "ilab_requests_cache.csv")
+    print(f"\n🎯 Target cache: {target_file}")
+    print("🔍 Scanning for cache files and conflict copies...")
     cache_files = find_cache_files()
+    if target_file not in cache_files and target_file.exists():
+        cache_files.append(target_file)
+    sources = [f for f in cache_files if f != target_file]
 
-    if not cache_files:
-        print("✓ No duplicate cache files found.")
+    if not sources:
+        print("✓ Nothing to consolidate.")
         return
 
-    if len(cache_files) == 1:
-        print(f"✓ Single cache file found: {cache_files[0]}")
-        print("  No consolidation needed.")
-        return
-
-    print(f"\n⚠ Found {len(cache_files)} cache file(s) — potential duplicates.\n")
-
-    # Load all records
     all_records = {}
-    for cache_path in cache_files:
-        print(f"Reading {cache_path}...")
+    for i, cache_path in enumerate(cache_files, 1):
+        if i % 500 == 0:
+            print(f"  read {i}/{len(cache_files)}...")
         all_records[cache_path] = load_cache_records(cache_path)
 
-    # Print summary
-    print_summary(cache_files, all_records)
+    merged = merge_records(all_records, preferred=target_file)
+    own = len(all_records.get(target_file, {}))
+    print(f"\nFound {len(sources)} other cache file(s) next to/besides the target.")
+    print(f"Target currently has {own} record(s); merged result has {len(merged)}.")
 
-    # Ask user which file to keep
-    print("\n📋 OPTIONS:")
-    print(f"  1. Keep the app directory cache:")
-    print(f"     {Path(__file__).parent / 'ilab_requests_cache.csv'}")
-    print(f"  2. Keep the OneDrive cache (if found)")
-    print(f"  3. Keep a specific file")
-    print(f"  4. Cancel (do nothing)\n")
-
-    choice = input("Choose an option (1-4): ").strip()
-
-    if choice == "4" or not choice:
+    if dry_run:
+        print("\n--dry-run: no changes made.")
+        return
+    if not assume_yes and input("\nWrite merged cache and move the copies into "
+                                f"'{BACKUP_DIR_NAME}'? (y/N): ").strip().lower() != "y":
         print("Cancelled. No changes made.")
         return
 
-    # Determine target file
-    target_file = None
-    if choice == "1":
-        target_file = Path(__file__).parent / "ilab_requests_cache.csv"
-    elif choice == "2":
-        # Find OneDrive cache
-        for f in cache_files:
-            if "OneDrive" in str(f):
-                target_file = f
-                break
-        if not target_file:
-            print("No OneDrive cache found.")
-            return
-    elif choice == "3":
-        print("\nAvailable files:")
-        for i, f in enumerate(cache_files, 1):
-            print(f"  {i}. {f}")
-        file_choice = input("\nChoose file number: ").strip()
+    # Keep a backup of the target before overwriting it
+    backup_dir = target_file.parent / BACKUP_DIR_NAME
+    backup_dir.mkdir(exist_ok=True)
+    if target_file.exists():
+        shutil.copy2(target_file, backup_dir / f"{target_file.name}.pre_consolidate")
+
+    with open(target_file, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(merged.values())
+    print(f"✓ Wrote {len(merged)} records to {target_file}")
+
+    # Move (not delete) the copies, so everything is recoverable
+    moved = 0
+    for cache_path in sources:
+        dest = backup_dir / cache_path.name
+        if dest.exists():
+            dest = backup_dir / f"{cache_path.parent.name}__{cache_path.name}"
         try:
-            target_file = cache_files[int(file_choice) - 1]
-        except (ValueError, IndexError):
-            print("Invalid selection.")
-            return
-    else:
-        print("Invalid choice.")
-        return
-
-    # Merge and write
-    print(f"\n📝 Consolidating into: {target_file}")
-    merged = merge_records(all_records)
-
-    # Write consolidated cache
-    ALL_COLS = [
-        "request_id", "name", "state", "created_at",
-        "start_on", "end_on", "completed_on",
-        "owner_name", "owner_email", "pi_name", "pi_email",
-        "service_name", "last_synced",
-        "assigned_to", "labels", "local_notes",
-        "core_lab", "microscope",
-        "training_date", "training_time", "training_day",
-        "class_taken",
-        "wf_laser_safety",
-        "wf_emailed", "wf_class_scheduled", "wf_not_required",
-        "wf_training_scheduled",
-        "wf_post_email", "wf_post_listserve",
-        "wf_post_approved", "wf_post_confirmed",
-        "schedule_exported", "local_only",
-        "form_data", "milestones_data", "_source",
-    ]
-
-    try:
-        with open(target_file, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(merged.values())
-        print(f"✓ Consolidated {len(merged)} records into {target_file}\n")
-    except Exception as e:
-        print(f"✗ Error writing consolidated cache: {e}")
-        return
-
-    # Optional: backup and delete old files
-    print("\n🗑️  What to do with the old cache files?")
-    print("  1. Keep them (safe, but leaves duplicates)")
-    print("  2. Rename them to .backup (preserves them but won't be used)")
-    print("  3. Delete them (irreversible!)")
-
-    cleanup = input("\nChoose (1-3): ").strip()
-
-    if cleanup in ("2", "3"):
-        for cache_path in cache_files:
-            if cache_path == target_file:
-                continue
-            try:
-                if cleanup == "2":
-                    backup_path = cache_path.with_suffix(".csv.backup")
-                    cache_path.rename(backup_path)
-                    print(f"  ✓ Backed up: {cache_path} → {backup_path}")
-                elif cleanup == "3":
-                    cache_path.unlink()
-                    print(f"  ✓ Deleted: {cache_path}")
-            except Exception as e:
-                print(f"  ⚠ Error handling {cache_path}: {e}")
-
-    print("\n✓ Consolidation complete!")
-    print(f"\n💡 TIP: To prevent future duplicates, both users should set the same")
-    print(f"   cache file path in prefs.json (data_file setting).")
-    print(f"   Recommended shared path:")
-    print(f"   C:\\Users\\NIC-ADMIN4\\OneDrive - UCSF\\Documents - CALM\\ilab_requests_cache.csv")
+            shutil.move(str(cache_path), str(dest))
+            moved += 1
+        except Exception as e:
+            print(f"  ⚠ Could not move {cache_path}: {e}")
+    print(f"✓ Moved {moved} file(s) to {backup_dir}")
+    print("\n💡 Close the app on both computers before running this, and make sure")
+    print("   both use the same data_file path in prefs.json.")
 
 
 if __name__ == "__main__":
-    consolidate_interactive()
+    import sys
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # emoji on cp1252 consoles
+    consolidate_interactive(sys.argv[1:])

@@ -12,7 +12,7 @@ CORE_ID = 0   # ← replace with your core ID
 # Use absolute path in app directory to avoid duplicate cache files when running
 # from different working directories. Users can override via prefs.json data_file.
 from pathlib import Path
-DATA_FILE = str(Path(__file__).parent / "ilab_requests_cache.csv")
+DATA_FILE = str(Path(__file__).resolve().parent / "ilab_requests_cache.csv")
 
 # ── Team members shown in the "Assigned To" dropdown ─────────────────────────
 TEAM_MEMBERS = [

@@ -378,3 +378,73 @@ def append_class_session(session: dict, xlsx_path: str,
     if rows_written:
         sh.save()
     return {"rows_written": rows_written, "duplicates_skipped": duplicates_skipped}
+
+
+def _class_cell_text(v, field: str) -> str:
+    """Normalise a cell value; dates become YYYY-MM-DD like the local sessions."""
+    import datetime as _dt
+    if v is None:
+        return ""
+    if isinstance(v, _dt.datetime):
+        return v.date().isoformat() if field == "date" else v.strftime("%I:%M%p").lstrip("0").lower()
+    if isinstance(v, _dt.date):
+        return v.isoformat()
+    if isinstance(v, (int, float)) and field == "date" and v > 20000:
+        # Excel serial date (Microsoft Graph returns these)
+        return (_dt.date(1899, 12, 30) + _dt.timedelta(days=int(v))).isoformat()
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    text = str(v).strip()
+    if field == "date" and text:
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%d %b %Y", "%b %d, %Y"):
+            try:
+                return _dt.datetime.strptime(text, fmt).date().isoformat()
+            except ValueError:
+                pass
+    return text
+
+
+def read_class_sessions(xlsx_path: str, sheet_name: str = "") -> list[dict]:
+    """Read the Microscope Intro Course Log back into session dicts.
+
+    The log has one row per student; rows sharing date + instructor (+ time
+    + location) are grouped into one session.  Returns [] if the file/sheet
+    does not exist yet.
+    """
+    if not HAS_OPENPYXL:
+        raise ImportError("openpyxl is required.  Install it with:  pip install openpyxl")
+    from graph_excel import is_graph_url
+    if is_graph_url(xlsx_path):
+        from graph_excel import GraphSheet
+        rows = GraphSheet(xlsx_path, sheet_name).read_values()
+    else:
+        if not Path(xlsx_path).exists():
+            return []
+        wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+        try:
+            ws = (wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames
+                  else wb.active)
+            rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    if not rows:
+        return []
+
+    fields = [CLASS_HEADER_MAP.get(_norm(str(h))) if h is not None else None
+              for h in rows[0]]
+    sessions: dict[tuple, dict] = {}
+    for row in rows[1:]:
+        flat: dict[str, str] = {}
+        for field, val in zip(fields, row):
+            if field and field not in flat:
+                flat[field] = _class_cell_text(val, field)
+        if not flat.get("name") or not flat.get("date"):
+            continue
+        key = (flat["date"], flat.get("instructor", "").lower(),
+               flat.get("time", "").lower(), flat.get("location", "").lower())
+        sess = sessions.setdefault(key, {
+            "date": flat["date"], "instructor": flat.get("instructor", ""),
+            "time": flat.get("time", ""), "location": flat.get("location", ""),
+            "students": []})
+        sess["students"].append({"name": flat["name"], "pi": flat.get("pi", "")})
+    return list(sessions.values())
