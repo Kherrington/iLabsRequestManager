@@ -1285,6 +1285,18 @@ class ILabManagerApp:
         ttk.Label(left, text="Upcoming Sessions",
                   font=("", 9, "bold")).pack(anchor="w", pady=(0, 3))
 
+        search_row = ttk.Frame(left)
+        search_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(search_row, text="Search names:").pack(side="left")
+        self._cs_search_var = tk.StringVar()
+        self._cs_count_var = tk.StringVar()
+        ttk.Entry(search_row, textvariable=self._cs_search_var,
+                  width=18).pack(side="left", padx=4, fill="x", expand=True)
+        ttk.Button(search_row, text="✕", width=3,
+                   command=lambda: self._cs_search_var.set("")).pack(side="left")
+        ttk.Label(left, textvariable=self._cs_count_var,
+                  foreground="#666").pack(anchor="w")
+
         sess_frame = ttk.Frame(left)
         sess_frame.pack(fill="both", expand=True)
 
@@ -1298,6 +1310,8 @@ class ILabManagerApp:
         self._cs_sess_tree.column("date",        width=90,  minwidth=70)
         self._cs_sess_tree.column("instructor",  width=110, minwidth=70)
         self._cs_sess_tree.bind("<<TreeviewSelect>>", self._cs_on_session_select)
+        self._cs_search_var.trace_add(
+            "write", lambda *_: self._cs_refresh_sessions_tree())
 
         sess_vsb = ttk.Scrollbar(sess_frame, orient="vertical",
                                   command=self._cs_sess_tree.yview)
@@ -1324,6 +1338,11 @@ class ILabManagerApp:
                                command=self._cs_sync_all)
         _sync_cls.pack(anchor="w")
         HoverTip.static(_sync_cls, _tt.BUTTONS.get("sync_classes", ""), self._tip_theme)
+        _merge_cls = ttk.Button(left, text="⇩  Merge Local File && Download History"
+                                .replace("&&", "&"),
+                                command=self._cs_merge_local_and_download)
+        _merge_cls.pack(anchor="w", pady=(6, 0))
+        HoverTip.static(_merge_cls, _tt.BUTTONS.get("merge_classes", ""), self._tip_theme)
 
         # ── Right: session detail (info + students) ───────────────────────────
         right = ttk.Frame(paned, padding=(6, 0, 0, 0))
@@ -1376,6 +1395,7 @@ class ILabManagerApp:
         self._cs_tree.column("name", width=210, minwidth=100)
         self._cs_tree.column("pi",   width=190, minwidth=80)
         self._cs_tree.bind("<Double-1>", self._cs_edit_student)
+        self._cs_tree.tag_configure("hit", background="#FFF59D", foreground="#000000")
 
         stu_vsb = ttk.Scrollbar(stu_frame, orient="vertical",
                                  command=self._cs_tree.yview)
@@ -1423,12 +1443,19 @@ class ILabManagerApp:
                 xlsx_path, str(p.get("intro_sheet", "") or "").strip())
         except Exception as exc:
             return f"Intro log not read ({exc})"
+        added_sess, added_stu = self._cs_merge_sessions(log_sessions)
+        if added_sess or added_stu:
+            self._cs_persist()
+        return f"Intro log: {added_sess} new session(s), {added_stu} new student(s)"
 
+    def _cs_merge_sessions(self, incoming: list[dict]) -> tuple[int, int]:
+        """Merge *incoming* sessions into self._cs_sessions without removing or
+        overwriting anything.  Returns (sessions added, students added)."""
         def _key(s):
             return (s.get("date", ""), s.get("instructor", "").strip().lower())
         local = {_key(s): s for s in self._cs_sessions}
         added_sess = added_stu = 0
-        for ls in log_sessions:
+        for ls in incoming:
             cur = local.get(_key(ls))
             if cur is None:
                 # Skip students already listed locally that day (the
@@ -1454,9 +1481,33 @@ class ILabManagerApp:
                     cur["students"].append(stu)
                     have.add(stu["name"].strip().lower())
                     added_stu += 1
-        if added_sess or added_stu:
-            self._cs_persist()
-        return f"Intro log: {added_sess} new session(s), {added_stu} new student(s)"
+        return added_sess, added_stu
+
+    def _cs_merge_local_and_download(self) -> None:
+        """Merge the app-folder class_session.json (not visible to other
+        people), then pull the whole Intro Course Log history and push
+        anything the log lacks."""
+        if self._autosave_job:
+            self.root.after_cancel(self._autosave_job)
+            self._do_autosave()
+        legacy = _APP_DIR / "class_session.json"
+        note = "no separate local file to merge"
+        if legacy.exists() and legacy.resolve() != Path(self._cs_file).resolve():
+            try:
+                raw = json.loads(legacy.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    raw = [raw]
+                s_add, st_add = self._cs_merge_sessions(raw)
+                self._cs_persist()
+                note = (f"local file {legacy.name}: {s_add} new session(s), "
+                        f"{st_add} new student(s)")
+            except Exception as exc:
+                messagebox.showerror("Local Class File",
+                                     f"Could not read {legacy}:\n{exc}")
+                return
+        log_note = self._cs_full_sync(silent=False)
+        self._cs_export_lbl.config(text=f"✓ {note}; {log_note}")
+        self._set_status(f"Class history merged — {note}; {log_note}.")
 
     def _cs_reload(self) -> str:
         """Re-read class sessions from disk and the Intro Course Log,
@@ -1467,8 +1518,26 @@ class ILabManagerApp:
         self._cs_refresh_sessions_tree()
         self._cs_sel_idx = None
         if idx is not None and idx < len(self._cs_sessions):
-            self._cs_sess_tree.selection_set(str(idx))
+            self._cs_select(idx)
         return note
+
+    def _cs_select(self, idx) -> None:
+        """Select session *idx*; clears the search if it is hiding that row."""
+        iid = str(idx)
+        if not self._cs_sess_tree.exists(iid):
+            self._cs_search_var.set("")
+            self._cs_refresh_sessions_tree()
+        if self._cs_sess_tree.exists(iid):
+            self._cs_sess_tree.selection_set(iid)
+
+    def _cs_session_matches(self, s: dict, q: str) -> bool:
+        if not q:
+            return True
+        hay = [s.get("date", ""), s.get("instructor", ""),
+               s.get("location", ""), s.get("time", "")]
+        for st in s.get("students", []):
+            hay += [st.get("name", ""), st.get("pi", "")]
+        return any(q in h.lower() for h in hay)
 
     def _cs_persist(self) -> None:
         """Write all sessions to JSON."""
@@ -1482,10 +1551,18 @@ class ILabManagerApp:
     def _cs_refresh_sessions_tree(self) -> None:
         """Rebuild the left-hand sessions list."""
         self._cs_sess_tree.delete(*self._cs_sess_tree.get_children())
+        q = self._cs_search_var.get().strip().lower()
+        shown = 0
         for i, s in enumerate(self._cs_sessions):
+            if not self._cs_session_matches(s, q):
+                continue
             self._cs_sess_tree.insert("", "end", iid=str(i),
                                        values=(s.get("date", ""),
                                                s.get("instructor", "")))
+            shown += 1
+        self._cs_count_var.set(
+            f"{shown} of {len(self._cs_sessions)} sessions" if q else "")
+        self._cs_refresh_students_tree()
 
     def _cs_on_session_select(self, _event=None) -> None:
         """Load the selected session's info and students into the right panel."""
@@ -1509,8 +1586,9 @@ class ILabManagerApp:
         self._cs_persist()
         self._cs_refresh_sessions_tree()
         new_iid = str(len(self._cs_sessions) - 1)
-        self._cs_sess_tree.selection_set(new_iid)
-        self._cs_sess_tree.see(new_iid)
+        self._cs_select(new_iid)
+        if self._cs_sess_tree.exists(new_iid):
+            self._cs_sess_tree.see(new_iid)
 
     def _cs_delete_session(self) -> None:
         if self._cs_sel_idx is None:
@@ -1547,7 +1625,7 @@ class ILabManagerApp:
         # Refresh the sessions list so date/instructor column updates
         sel_iid = str(self._cs_sel_idx)
         self._cs_refresh_sessions_tree()
-        self._cs_sess_tree.selection_set(sel_iid)
+        self._cs_select(sel_iid)
         self._set_status("Session info saved.")
 
     def _cs_refresh_students_tree(self) -> None:
@@ -1555,9 +1633,13 @@ class ILabManagerApp:
         if self._cs_sel_idx is None:
             return
         students = self._cs_sessions[self._cs_sel_idx].get("students", [])
+        q = self._cs_search_var.get().strip().lower()
         for i, s in enumerate(students):
+            hit = bool(q) and (q in s.get("name", "").lower()
+                               or q in s.get("pi", "").lower())
             self._cs_tree.insert("", "end", iid=str(i),
-                                  values=(s.get("name", ""), s.get("pi", "")))
+                                  values=(s.get("name", ""), s.get("pi", "")),
+                                  tags=("hit",) if hit else ())
 
     def _cs_add_from_selection(self) -> None:
         """Add the currently selected iLab request's requester to the student list."""
@@ -1672,7 +1754,7 @@ class ILabManagerApp:
             self._cs_persist()
             sel_iid = str(self._cs_sel_idx)
             self._cs_refresh_sessions_tree()
-            self._cs_sess_tree.selection_set(sel_iid)
+            self._cs_select(sel_iid)
 
     def _cs_sort(self, which: str, col: str) -> None:
         """Click a heading: sort ascending, click again for descending."""
@@ -1689,8 +1771,8 @@ class ILabManagerApp:
             self._cs_refresh_sessions_tree()
             self._cs_sel_idx = None
             if sel is not None:
-                self._cs_sess_tree.selection_set(
-                    str(next(i for i, s in enumerate(self._cs_sessions) if s is sel)))
+                self._cs_select(
+                    next(i for i, x in enumerate(self._cs_sessions) if x is sel))
             tree, heads = self._cs_sess_tree, {"date": "Date", "instructor": "Instructor"}
         else:
             if self._cs_sel_idx is None:
