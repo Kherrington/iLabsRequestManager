@@ -21,7 +21,7 @@ def _load_dotenv() -> None:
     Existing environment variables are never overwritten.
     """
     candidates = [
-        pathlib.Path(__file__).parent / ".env",
+        pathlib.Path(__file__).resolve().parent / ".env",
         pathlib.Path.cwd() / ".env",
     ]
     for env_path in candidates:

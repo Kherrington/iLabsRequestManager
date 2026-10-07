@@ -10,9 +10,11 @@ Usage::
 """
 
 import json
+import os
 from pathlib import Path
 
-_PREFS_FILE = Path(__file__).parent / "prefs.json"
+APP_DIR = Path(__file__).resolve().parent
+_PREFS_FILE = APP_DIR / "prefs.json"
 
 _DEFAULTS: dict = {
     "dark_mode":        "0",
@@ -31,6 +33,12 @@ _DEFAULTS: dict = {
     "class_quantity":   "2",
     "class_unit_price": "100",
     "max_charge":       "200",
+    # ── Auto-sync (minutes; 0 = off) ─────────────────────────────────────────
+    "sync_on_open":         "1",  # 1 = run Sync All shortly after the app starts
+    "idle_sync_minutes":    "5",  # Records sync this long after the last edit
+    "records_sync_minutes": "60", # periodic Records & Cache sync
+    "ilab_sync_minutes":    "60", # periodic iLab sync
+    "class_session_file":   "",   # blank = class_session.json beside the data file
 }
 
 _cache: dict | None = None
@@ -56,3 +64,23 @@ def save_prefs(prefs: dict) -> None:
     _PREFS_FILE.write_text(
         json.dumps(prefs, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+
+def abs_path(value: str) -> str:
+    """Return *value* as an absolute path (relative paths resolve against the
+    app directory).  Blank values and http(s) URLs are returned unchanged."""
+    value = str(value or "").strip()
+    if not value or value.lower().startswith(("http://", "https://")):
+        return value
+    p = Path(os.path.expandvars(value)).expanduser()
+    if not p.is_absolute():
+        p = APP_DIR / p
+    return str(p.resolve())
+
+
+def minutes(key: str) -> int:
+    """A non-negative integer minutes preference (invalid/blank -> 0)."""
+    try:
+        return max(0, int(float(str(get_prefs().get(key, "0")).strip() or 0)))
+    except ValueError:
+        return 0

@@ -24,8 +24,14 @@ BUTTONS = {
     ),
     "sync_cache": (
         "Sync Records & Cache (non-iLab)\n"
-        "Reloads the shared records file from disk to pick up changes made "
-        "by other machines. Does not contact iLab."
+        "Saves your pending edits, then reloads every non-iLab column and "
+        "the Class Schedule sessions from the shared files to pick up "
+        "changes made by other machines. Does not contact iLab."
+    ),
+    "sync_classes": (
+        "Sync All Classes\n"
+        "Two-way sync with the Microscope Intro Course Log: pulls sessions "
+        "and students from the log, then adds any local students it lacks."
     ),
     "clear_all": (
         "Clear All Requests\n"
