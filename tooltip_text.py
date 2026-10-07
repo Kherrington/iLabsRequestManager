@@ -24,14 +24,20 @@ BUTTONS = {
     ),
     "sync_cache": (
         "Sync Records & Cache (non-iLab)\n"
-        "Saves your pending edits, then reloads every non-iLab column and "
-        "the Class Schedule sessions from the shared files to pick up "
-        "changes made by other machines. Does not contact iLab."
+        "Saves your pending edits, then reloads non-iLab columns from share cache file."
+        "Class Schedule and Training data is synced with shared files."
+         "Does not contact iLab."
     ),
     "sync_classes": (
         "Sync All Classes\n"
         "Two-way sync with the Microscope Intro Course Log: pulls sessions "
         "and students from the log, then adds any local students it lacks."
+    ),
+    "merge_classes": (
+        "Merge Local File & Download History\n"
+        "Merges the class_session.json kept in the app folder (visible only "
+        "on this computer) into the shared class sessions, downloads the full "
+        "history from the Intro Course Log, and adds anything the log lacks."
     ),
     "clear_all": (
         "Clear All Requests\n"
@@ -69,8 +75,12 @@ COLUMNS = {
     "service_name":  "The iLab service that was requested.",
     "state": (
         "Request status from iLab:\n"
-        "{{proposed}}  {{requested}}  {{processing}}\n"
-        "{{financials_approved}}  {{completed}}  {{cancelled}}\n"
+        "If the status is: {{proposed}}  {{requested}} {{financials_approved}}  \n
+         "THEN the user has submitted and is waiting an email.\n" 
+         "If the status is (or if you emailed then change to): {{processing}}\n"
+         "THEN the core has accepted the request and is working on it.\n"
+        "Change to {{completed}}  {{cancelled}}\n"
+        "WHEN the work is finished or the request is cancelled.\n"
         "Click a heading to sort; click a Status cell to push a new state."
     ),
     "assigned_to":   "Team member responsible for this request. Click a cell to change.",
