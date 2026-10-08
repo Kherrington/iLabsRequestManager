@@ -75,7 +75,7 @@ COLUMNS = {
     "service_name":  "The iLab service that was requested.",
     "state": (
         "Request status from iLab:\n"
-        "If the status is: {{proposed}}  {{requested}} {{financials_approved}}  \n
+        "If the status is: {{proposed}}  {{requested}} {{financials_approved}}\n"
          "THEN the user has submitted and is waiting an email.\n" 
          "If the status is (or if you emailed then change to): {{processing}}\n"
          "THEN the core has accepted the request and is working on it.\n"
@@ -85,7 +85,7 @@ COLUMNS = {
     ),
     "assigned_to":   "Team member responsible for this request. Click a cell to change.",
     "labels":        "Local tags for this request. Click a cell to edit.",
-    "core_lab":      "Core facility handling the request (CALM or CVRI).",
+    "core_lab":      "Core Location of microscope (CALM or CVRI).",
     "microscope":    "Microscope the user is being trained on.",
     "training_date": "Date of the training session.",
     "training_day":  "Day of the week of the training.",
