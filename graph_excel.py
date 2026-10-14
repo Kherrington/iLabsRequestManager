@@ -35,6 +35,12 @@ try:
 except ImportError:
     HAS_MSAL = False
 
+try:                         # pick up GRAPH_CLIENT_ID etc. from .env
+    from ilabs_client import _load_dotenv
+    _load_dotenv()
+except Exception:
+    pass
+
 GRAPH = "https://graph.microsoft.com/v1.0"
 DEFAULT_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"   # Graph Command Line Tools
 SCOPES = (os.environ.get("GRAPH_SCOPES") or "Files.ReadWrite.All").split()
@@ -73,7 +79,7 @@ def _get_app():
                 _token_cache.deserialize(_CACHE_PATH.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        client_id = os.environ.get("GRAPH_CLIENT_ID") or DEFAULT_CLIENT_ID
+        client_id = (os.environ.get("GRAPH_CLIENT_ID") or "").strip() or DEFAULT_CLIENT_ID
         tenant = os.environ.get("GRAPH_TENANT") or "organizations"
         _app = msal.PublicClientApplication(
             client_id,
