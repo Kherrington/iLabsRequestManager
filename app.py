@@ -288,7 +288,8 @@ class ILabManagerApp:
         self.root.minsize(900, 600)
 
         _p = _prefs.get_prefs()
-        _data_path = str(_p.get("data_file", "") or "").strip() or DATA_FILE
+        _data_path = (str(_p.get("cache_url", "") or "").strip()
+                      or str(_p.get("data_file", "") or "").strip() or DATA_FILE)
         # Resolve relative paths to app directory to avoid duplicate caches
         from pathlib import Path as _Path
         _data_path_obj = _Path(_data_path)
@@ -1488,7 +1489,8 @@ class ILabManagerApp:
                                    "Select a session to export.")
             return
         p = _prefs.get_prefs()
-        xlsx_path = str(p.get("intro_xlsx", "") or "").strip()
+        xlsx_path = (str(p.get("intro_url", "") or "").strip()
+                     or str(p.get("intro_xlsx", "") or "").strip())
         if not xlsx_path:
             messagebox.showwarning(
                 "xlsx Path Not Set",
@@ -2447,7 +2449,8 @@ class ILabManagerApp:
             return False
 
         p = _prefs.get_prefs()
-        xlsx_path = str(p.get(f"{core.lower()}_xlsx", "") or "").strip()
+        xlsx_path = (str(p.get(f"{core.lower()}_url", "") or "").strip()
+                     or str(p.get(f"{core.lower()}_xlsx", "") or "").strip())
         if not xlsx_path:
             if not silent:
                 messagebox.showwarning(
@@ -3099,7 +3102,8 @@ class PreferencesDialog(tk.Toplevel):
         }
         # Make sure all expected keys exist
         for k, default in [
-            ("data_file",""), ("cache_sheet","Cache"),
+            ("data_file",""), ("cache_sheet","Cache"), ("cache_url",""),
+            ("calm_url",""), ("cvri_url",""), ("intro_url",""),
             ("calm_xlsx",""), ("cvri_xlsx",""),
             ("intro_xlsx",""), ("intro_sheet",""),
             ("class_service_id",""), ("class_price_id",""),
@@ -3108,7 +3112,8 @@ class PreferencesDialog(tk.Toplevel):
             if k not in self._vars:
                 self._vars[k] = tk.StringVar(value=default)
 
-        self._original_data_file = self._vars["data_file"].get()
+        self._original_data_file = (self._vars["cache_url"].get().strip()
+                                    or self._vars["data_file"].get().strip())
 
         PAD = dict(padx=8, pady=4)
 
@@ -3232,9 +3237,41 @@ class PreferencesDialog(tk.Toplevel):
         ttk.Separator(self, orient="horizontal").grid(
             row=23, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
 
+        # ── Section: Excel Online (Microsoft Graph) ───────────────────────────
+        ttk.Label(self, text="Excel Online URLs (used instead of the local paths above)",
+                  font=("", 10, "bold")).grid(
+            row=24, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+        for i, (label, key, sheet_key) in enumerate([
+            ("CALM schedule:", "calm_url",  "calm_sheet"),
+            ("CVRI schedule:", "cvri_url",  "cvri_sheet"),
+            ("Intro log:",     "intro_url", "intro_sheet"),
+            ("Shared cache:",  "cache_url", "cache_sheet"),
+        ], start=25):
+            ttk.Label(self, text=label, width=14, anchor="e").grid(
+                row=i, column=0, sticky="e", **PAD)
+            ttk.Entry(self, textvariable=self._vars[key], width=40).grid(
+                row=i, column=1, sticky="ew", **PAD)
+            ttk.Button(self, text="Test",
+                       command=lambda k=key, sk=sheet_key: self._test_url(k, sk)
+                       ).grid(row=i, column=2, **PAD)
+        ttk.Label(self, text="Cache sheet:", width=14, anchor="e").grid(
+            row=29, column=0, sticky="e", **PAD)
+        ttk.Entry(self, textvariable=self._vars["cache_sheet"], width=22).grid(
+            row=29, column=1, sticky="w", **PAD)
+        ttk.Label(
+            self,
+            text="Paste the workbook's OneDrive/SharePoint link. Leave blank to use a local file.\n"
+                 "Needs GRAPH_CLIENT_ID in .env; you sign in with your UCSF account once.\n"
+                 "Restart the app after changing the shared-cache URL.",
+            foreground=self._fg2,
+        ).grid(row=30, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 8))
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=31, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
+
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(self, padding=(8, 4, 12, 10))
-        btn_row.grid(row=24, column=0, columnspan=4, sticky="e")
+        btn_row.grid(row=32, column=0, columnspan=4, sticky="e")
         ttk.Button(btn_row, text="Save", command=self._save,
                    width=10).pack(side="right", padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy,
@@ -3245,6 +3282,27 @@ class PreferencesDialog(tk.Toplevel):
         px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
         py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+    def _test_url(self, key: str, sheet_key: str) -> None:
+        url = self._vars[key].get().strip()
+        sheet = self._vars[sheet_key].get().strip()
+        if not url:
+            messagebox.showinfo("Excel Online", "Enter a workbook URL first.")
+            return
+
+        def worker():
+            try:
+                from graph_excel import GraphSheet
+                gs = GraphSheet(url, sheet)
+                hdr = gs.headers()
+                msg = (f"Connected. Sheet: {gs.sheet_name}\n"
+                       f"Headers: {', '.join(hdr) if hdr else '(empty sheet)'}")
+                ok = True
+            except Exception as exc:
+                msg, ok = str(exc), False
+            self.after(0, lambda: (messagebox.showinfo if ok else messagebox.showerror)(
+                "Excel Online", msg, parent=self))
+        threading.Thread(target=worker, daemon=True).start()
 
     def _browse_data_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -3269,7 +3327,8 @@ class PreferencesDialog(tk.Toplevel):
             self._vars[key].set(path)
 
     def _save(self) -> None:
-        new_data_file = self._vars["data_file"].get().strip()
+        new_data_file = (self._vars["cache_url"].get().strip()
+                         or self._vars["data_file"].get().strip())
         _prefs.save_prefs({k: v.get() for k, v in self._vars.items()})
         self.destroy()
         if new_data_file != self._original_data_file:
