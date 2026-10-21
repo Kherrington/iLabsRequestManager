@@ -27,7 +27,8 @@ except ImportError:
 import prefs as _prefs
 from calendar_widget import CalendarPicker
 from xlsx_export import (append_training_row, append_class_session,
-                         read_class_sessions, HAS_OPENPYXL)
+                         read_class_sessions, HAS_OPENPYXL,
+                         pending_path, pending_files, seed_pending)
 from config import (
     CORE_ID, ILAB_BASE_URL, DATA_FILE, TEAM_MEMBERS, LABELS,
     MICROSCOPES, TRAINING_DAYS, CORE_OPTIONS, ACTIVE_STATES,
@@ -39,11 +40,27 @@ from tooltips import HoverTip
 from ilabs_client import ILabClient, ILabError
 
 _APP_DIR                 = _prefs.APP_DIR
-_CALM_WELCOME_FILE       = _APP_DIR / "CALM_welcome.txt"
-_CVRI_WELCOME_FILE       = _APP_DIR / "CVRI_welcome.txt"
-_COMMON_RESPONSE_FILE    = _APP_DIR / "Common_response.txt"
-_COMMON_RESPONSE_IMG_FILE = _APP_DIR / "Common_response_image.txt"
-_CVRI_ACCESS_FILE        = _APP_DIR / "CVRI-Access.txt"
+_LOCK_RETRY_MS           = 5 * 60 * 1000    # auto-retry a locked shared file
+# Email templates are read from / written to the one shared folder.
+_CALM_WELCOME_FILE       = _prefs.shared_file("CALM_welcome.txt")
+_CVRI_WELCOME_FILE       = _prefs.shared_file("CVRI_welcome.txt")
+_COMMON_RESPONSE_FILE    = _prefs.shared_file("Common_response.txt")
+_COMMON_RESPONSE_IMG_FILE = _prefs.shared_file("Common_response_image.txt")
+_CVRI_ACCESS_FILE        = _prefs.shared_file("CVRI-Access.txt")
+
+
+def _read_text_file(path: Path, default: str = "") -> str:
+    """Read a shared text file; *default* if it is missing or unreachable."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return default
+
+
+def _write_text_file(path: Path, text: str) -> None:
+    """Overwrite a shared text file, clearing a read-only flag first."""
+    _prefs.make_writable(path)
+    path.write_text(text, encoding="utf-8")
 
 # ── Email-template markup parser ──────────────────────────────────────────────
 # Supports: **bold**   *italic*   __underline__
@@ -318,8 +335,13 @@ class ILabManagerApp:
         # directory) so the same cache is used wherever the app is launched from
         _data_path = _prefs.abs_path(_p.get("data_file", "") or DATA_FILE)
         self._cs_file = _class_session_path(_data_path)
+        self._lock_retry_jobs: dict[str, str] = {}
         self._data = DataStore(
             _data_path, remote_sheet=str(_p.get("cache_sheet", "") or "Cache"))
+        # Cache CSV locked on save: keep working in memory, retry in 5 minutes
+        self._data.on_save_locked = lambda msg: self.root.after(
+            0, lambda: self._schedule_lock_retry(
+                "cache", self._data.filepath.name, self._data.save))
         # Excel Online push/pull results arrive on a worker thread
         self._data.on_remote_status = lambda msg, err: self.root.after(
             0, lambda: self._set_status(("⚠ " if err else "") + msg))
@@ -336,6 +358,13 @@ class ILabManagerApp:
         self._idle_sync_job: str | None = None
         self._periodic_jobs: dict[str, str] = {}
         self._ilab_syncing = False
+
+        if not _prefs.shared_dir().is_dir():
+            messagebox.showwarning(
+                "Shared Folder Not Found",
+                f"Cannot reach the shared folder:\n{_prefs.shared_dir()}\n\n"
+                "Check the X: drive is connected, or change the folder in "
+                "Settings. Until it is reachable, nothing can be loaded or saved.")
 
         self._build_ui()
         self._data.reload()          # pick up any changes written by other machines
@@ -786,8 +815,9 @@ class ILabManagerApp:
         txt.tag_configure("underline", underline=True)
 
         def _reload():
-            content = path.read_text(encoding="utf-8") if path.exists() else (
-                f"[No template file yet — click Edit to create {path.name}]")
+            content = _read_text_file(
+                path, f"[Could not read {path} — check the shared folder is "
+                      "reachable, or click Edit to create it]")
             txt.config(state="normal")
             txt.delete("1.0", "end")
             for chunk, tags in _parse_template_markup(content):
@@ -838,18 +868,16 @@ class ILabManagerApp:
         bar = ttk.Frame(dlg)
         bar.pack(fill="x", padx=8, pady=(0, 8))
 
-        def _copy_plain():
-            content = path.read_text(encoding="utf-8") if path.exists() else ""
-            self.root.clipboard_clear()
-            self.root.clipboard_append(_strip_template_markup(content))
-            self._set_status(f"'{title}' copied to clipboard.")
-
         def _copy_image():
-            img_filename = _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip() if _COMMON_RESPONSE_IMG_FILE.exists() else ""
+            img_filename = _read_text_file(_COMMON_RESPONSE_IMG_FILE).strip()
             if not img_filename:
                 self._set_status("No image configured.")
                 return
-            img_path = _APP_DIR / img_filename
+            # Shared folder first, then the app folder (older setups)
+            img_path = next((d / img_filename
+                             for d in (_prefs.shared_dir(), _APP_DIR)
+                             if (d / img_filename).exists()),
+                            _prefs.shared_dir() / img_filename)
             if not img_path.exists():
                 self._set_status(f"Image file not found: {img_path}")
                 return
@@ -862,10 +890,11 @@ class ILabManagerApp:
             dlg.destroy()
             self._open_template_edit(title, path)
 
-        ttk.Button(bar, text="Copy (Formatted)", command=_copy_formatted).pack(side="left")
-        ttk.Button(bar, text="Copy as Text",     command=_copy_plain).pack(side="left", padx=6)
+        # Only the formatted text is ever copied (markup markers never reach
+        # the clipboard), so there is a single Copy button.
+        ttk.Button(bar, text="Copy", command=_copy_formatted).pack(side="left")
         # Show Copy Image button if image is configured
-        if _COMMON_RESPONSE_IMG_FILE.exists() and _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip():
+        if _read_text_file(_COMMON_RESPONSE_IMG_FILE).strip():
             ttk.Button(bar, text="Copy Image",   command=_copy_image).pack(side="left", padx=6)
         ttk.Button(bar, text="Edit…",            command=_edit).pack(side="left", padx=6)
         ttk.Button(bar, text="Close",            command=dlg.destroy).pack(side="right")
@@ -923,7 +952,7 @@ class ILabManagerApp:
         txt.pack(side="left", fill="both", expand=True)
         txt_ref.append(txt)
 
-        content = path.read_text(encoding="utf-8") if path.exists() else ""
+        content = _read_text_file(path)
         txt.insert("1.0", content)
 
         # Image selector (if this is Common Response template)
@@ -932,7 +961,7 @@ class ILabManagerApp:
             img_frame = ttk.LabelFrame(dlg, text="Associated Image (optional)", padding=6)
             img_frame.pack(fill="x", padx=8, pady=4)
 
-            saved_img = _COMMON_RESPONSE_IMG_FILE.read_text(encoding="utf-8").strip() if _COMMON_RESPONSE_IMG_FILE.exists() else ""
+            saved_img = _read_text_file(_COMMON_RESPONSE_IMG_FILE).strip()
             img_var = tk.StringVar(value=saved_img)
 
             ttk.Label(img_frame, text="Image file:").pack(side="left", padx=(0, 4))
@@ -953,12 +982,20 @@ class ILabManagerApp:
         bar.pack(fill="x", padx=8, pady=(0, 8))
 
         def _save():
-            path.write_text(txt.get("1.0", "end-1c"), encoding="utf-8")
-            # Save image path if this is Common Response template
-            if title == "Common Response" and 'img_var' in locals():
-                img_filename = img_var.get().strip()
-                if img_filename:
-                    _COMMON_RESPONSE_IMG_FILE.write_text(img_filename, encoding="utf-8")
+            try:
+                _write_text_file(path, txt.get("1.0", "end-1c"))
+                # Save image path if this is Common Response template
+                if title == "Common Response" and 'img_var' in locals():
+                    img_filename = img_var.get().strip()
+                    if img_filename:
+                        _write_text_file(_COMMON_RESPONSE_IMG_FILE, img_filename)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Could Not Save",
+                    f"Could not write {path}\n\n{exc}\n\n"
+                    "Check that the shared folder is reachable and the file "
+                    "is not locked by another user.", parent=dlg)
+                return
             self._set_status(f"Saved {path.name}.")
             dlg.destroy()
 
@@ -1810,8 +1847,11 @@ class ILabManagerApp:
         sheet = str(p.get("intro_sheet", "") or "").strip()
         pull_note = self._cs_reload()
         try:
+            # Students already waiting in a temporary (locked-file) copy count
+            # as logged, so they are not saved again on every sync.
             in_log = {(s["date"], st["name"].strip().lower())
-                      for s in read_class_sessions(xlsx_path, sheet)
+                      for src in [xlsx_path, *map(str, pending_files(xlsx_path))]
+                      for s in read_class_sessions(src, sheet)
                       for st in s["students"]}
             pushed = 0
             for sess in self._cs_sessions:
@@ -1822,9 +1862,14 @@ class ILabManagerApp:
                     continue
                 part = {**sess, "students": new}
                 ok, res = self._run_export_with_retry(
-                    lambda part=part: append_class_session(
-                        part, xlsx_path, sheet_name=sheet), silent=silent)
+                    lambda path, part=part: append_class_session(
+                        part, path, sheet_name=sheet),
+                    silent=silent, xlsx_path=xlsx_path, sheet_name=sheet)
                 if not ok:
+                    self._schedule_lock_retry(
+                        "classlog", Path(xlsx_path).name,
+                        lambda: self._set_status(
+                            "Classes: " + self._cs_full_sync(silent=True)))
                     return f"{pull_note}; push to log skipped (file in use)"
                 pushed += res.get("rows_written", 0)
         except Exception as exc:
@@ -1867,10 +1912,14 @@ class ILabManagerApp:
         sheet_name = str(p.get("intro_sheet", "") or "").strip()
         try:
             ok, result = self._run_export_with_retry(
-                lambda: append_class_session(sess, xlsx_path, sheet_name=sheet_name),
-                silent=False,
+                lambda path: append_class_session(sess, path, sheet_name=sheet_name),
+                silent=False, xlsx_path=xlsx_path, sheet_name=sheet_name,
             )
             if not ok:
+                self._schedule_lock_retry(
+                    "classlog", Path(xlsx_path).name,
+                    lambda: self._set_status(
+                        "Classes: " + self._cs_full_sync(silent=True)))
                 return
             n   = result.get("rows_written", 0)
             dup = result.get("duplicates_skipped", 0)
@@ -2859,19 +2908,23 @@ class ILabManagerApp:
 
         sheet_name = str(p.get(f"{core.lower()}_sheet", "") or "").strip()
 
+        rec_to_export = self._current_rec
         ok, result = self._run_export_with_retry(
-            lambda: append_training_row(self._current_rec, xlsx_path,
-                                        sheet_name=sheet_name),
-            silent=silent,
+            lambda path: append_training_row(rec_to_export, path,
+                                             sheet_name=sheet_name),
+            silent=silent, xlsx_path=xlsx_path, sheet_name=sheet_name,
         )
         if not ok:
+            self._schedule_lock_retry(
+                f"export:{req_id}", Path(xlsx_path).name,
+                lambda: self._retry_schedule_export(req_id))
             return False
 
         # Mark as exported so auto-export doesn't run again
         self._data.update_local_fields(req_id, schedule_exported="1")
         self._current_rec["schedule_exported"] = "1"
         self._exported_lbl.config(text="✓ Exported to records")
-        fname     = Path(xlsx_path).name
+        fname     = result.get("pending_file") or Path(xlsx_path).name
         sheet_lbl = f" → '{sheet_name}'" if sheet_name else ""
 
         if result.get("duplicate"):
@@ -2905,27 +2958,91 @@ class ILabManagerApp:
             )
         return True
 
-    def _run_export_with_retry(self, fn, silent: bool):
+    def _run_export_with_retry(self, fn, silent: bool, xlsx_path: str,
+                               sheet_name: str = ""):
         """
-        Call the zero-arg *fn* (an xlsx export call). If it fails because the
-        target file is open in Excel (PermissionError), offer a Retry/Cancel
-        prompt in interactive mode so the user can close Excel and retry
-        without losing the data; in silent/auto-export mode, just report the
-        failure via the status bar instead of blocking with a dialog.
+        Call *fn(path)* (an xlsx export call) on *xlsx_path*. If the file is
+        locked (open in Excel / saved by someone else):
 
-        Returns (True, result) on success, (False, None) if the export was
-        never completed. Non-lock exceptions propagate to the caller.
+        * interactive: Yes = retry now, No = save the rows to a temporary
+          time-stamped file next to it (merge later with
+          consolidate_pending.py), Cancel = give up (the caller schedules an
+          automatic retry in 5 minutes);
+        * silent/auto-export: save to a time-stamped file straight away if the
+          "save temporary file when locked" preference is on, otherwise just
+          report via the status bar.
+
+        Returns (True, result) on success -- result["pending_file"] names the
+        temporary file when that was used -- or (False, None) if nothing was
+        written. Non-lock exceptions propagate to the caller.
         """
         while True:
             try:
-                return True, fn()
+                return True, fn(xlsx_path)
             except PermissionError as exc:
                 if silent:
+                    if str(_prefs.get_prefs().get("pending_on_lock", "0")) == "1":
+                        return self._export_to_pending(fn, xlsx_path, sheet_name)
                     self._set_status(f"⚠ Export skipped — {exc}")
                     return False, None
-                if not messagebox.askretrycancel("File In Use", str(exc)):
+                answer = messagebox.askyesnocancel(
+                    "File In Use",
+                    f"{exc}\n\nYes = retry now\n"
+                    "No = save to a temporary time-stamped file instead\n"
+                    "Cancel = retry automatically in 5 minutes")
+                if answer is None:
                     return False, None
-                # Loop back and retry the save.
+                if answer is False:
+                    return self._export_to_pending(fn, xlsx_path, sheet_name)
+                # Yes: loop back and retry the save.
+
+    def _export_to_pending(self, fn, xlsx_path: str, sheet_name: str):
+        """Write the export to a new time-stamped sibling of *xlsx_path*."""
+        try:
+            pp = pending_path(xlsx_path)
+            seed_pending(xlsx_path, pp, sheet_name)
+            result = fn(pp)
+        except OSError as exc:
+            self._set_status(f"⚠ Could not save temporary file — {exc}")
+            return False, None
+        if isinstance(result, dict):
+            result["pending_file"] = Path(pp).name
+        self._set_status(
+            f"⚠ {Path(xlsx_path).name} is locked — saved to {Path(pp).name}. "
+            "Run consolidate_pending.py to merge it later.")
+        return True, result
+
+    def _schedule_lock_retry(self, key: str, label: str, fn) -> None:
+        """A shared file was locked (open in Excel / saved by someone else):
+        run *fn* again in 5 minutes.  *fn* re-schedules itself if the file is
+        still locked, so this keeps trying until the write succeeds.  One
+        pending retry per *key*."""
+        if key in self._lock_retry_jobs:
+            return
+
+        def run():
+            self._lock_retry_jobs.pop(key, None)
+            try:
+                fn()
+            except Exception as exc:
+                self._set_status(f"⚠ Retry for {label} failed — {exc}")
+
+        self._lock_retry_jobs[key] = self.root.after(_LOCK_RETRY_MS, run)
+        self._set_status(
+            f"⚠ {label} is locked — will retry automatically in 5 minutes.")
+
+    def _retry_schedule_export(self, req_id: str) -> None:
+        rec = self._data.get_record(req_id)
+        if not rec or rec.get("schedule_exported", "0") == "1":
+            return
+        if rec.get("state") == "completed":
+            self._auto_export_on_complete(req_id)      # export, then clean up
+            return
+        saved, self._current_rec = self._current_rec, rec
+        try:
+            self._on_export_to_schedule(silent=True)
+        finally:
+            self._current_rec = saved
 
     def _cleanup_completed_local_entries(self) -> None:
         """Run after an iLab sync: local-only manual entries don't come back
@@ -3541,34 +3658,36 @@ class PreferencesDialog(tk.Toplevel):
             ("class_quantity","2"), ("class_unit_price","100"),
             ("sync_on_open","1"), ("idle_sync_minutes","5"),
             ("records_sync_minutes","60"), ("ilab_sync_minutes","60"),
-            ("class_session_file",""),
+            ("class_session_file",""), ("pending_on_lock","0"),
         ]:
             if k not in self._vars:
                 self._vars[k] = tk.StringVar(value=default)
 
-        self._original_data_file = self._vars["data_file"].get()
+        self._original_data_file = self._vars["shared_dir"].get()
         self._open_var = tk.BooleanVar(
             value=self._vars["sync_on_open"].get().strip() == "1")
+        self._pending_var = tk.BooleanVar(
+            value=self._vars["pending_on_lock"].get().strip() == "1")
 
         PAD = dict(padx=8, pady=4)
 
         # ── Section: shared data file ─────────────────────────────────────────
-        ttk.Label(self, text="Shared Data File",
+        ttk.Label(self, text="Shared Folder",
                   font=("", 10, "bold")).grid(
             row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(12, 4))
 
-        ttk.Label(self, text="Data File (CSV):", width=14, anchor="e").grid(
+        ttk.Label(self, text="Folder:", width=14, anchor="e").grid(
             row=1, column=0, sticky="e", **PAD)
-        ttk.Entry(self, textvariable=self._vars["data_file"], width=40).grid(
+        ttk.Entry(self, textvariable=self._vars["shared_dir"], width=40).grid(
             row=1, column=1, sticky="ew", **PAD)
         ttk.Button(self, text="Browse…",
-                   command=self._browse_data_file).grid(row=1, column=2, **PAD)
+                   command=self._browse_shared_dir).grid(row=1, column=2, **PAD)
 
         ttk.Label(
             self,
-            text="Point to a OneDrive/shared folder to sync across machines.\n"
-                 "Leave blank to use the default file in the app directory.\n"
-                 "Restart the app after changing this path.",
+            text="The cache CSV, the Training Schedule / Intro Course Log xlsx files\n"
+                 "and the email template .txt files are all read from and written\n"
+                 "to this one folder.  Restart the app after changing it.",
             foreground=self._fg2,
         ).grid(row=2, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
 
@@ -3589,11 +3708,9 @@ class PreferencesDialog(tk.Toplevel):
             # xlsx path row
             ttk.Label(self, text=f"{core} xlsx:", width=14, anchor="e").grid(
                 row=r, column=0, sticky="e", **PAD)
-            ttk.Entry(self, textvariable=self._vars[path_key], width=40).grid(
+            ttk.Entry(self, textvariable=self._vars[path_key], width=40,
+                      state="readonly").grid(
                 row=r, column=1, sticky="w", **PAD)
-            ttk.Button(self, text="Browse…",
-                       command=lambda k=path_key: self._browse(k)).grid(
-                row=r, column=2, **PAD)
 
             # Sheet name row
             ttk.Label(self, text="Sheet name:", width=14, anchor="e").grid(
@@ -3606,7 +3723,7 @@ class PreferencesDialog(tk.Toplevel):
 
         ttk.Label(
             self,
-            text="Point to your existing Training Schedule xlsx files.\n"
+            text="Training Schedule xlsx files live in the shared folder (fixed names).\n"
                  "If the file does not exist it will be created with default headers.",
             foreground=self._fg2,
         ).grid(row=9, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
@@ -3621,11 +3738,9 @@ class PreferencesDialog(tk.Toplevel):
 
         ttk.Label(self, text="Intro Log xlsx:", width=14, anchor="e").grid(
             row=12, column=0, sticky="e", **PAD)
-        ttk.Entry(self, textvariable=self._vars["intro_xlsx"], width=40).grid(
+        ttk.Entry(self, textvariable=self._vars["intro_xlsx"], width=40,
+                  state="readonly").grid(
             row=12, column=1, sticky="w", **PAD)
-        ttk.Button(self, text="Browse…",
-                   command=lambda: self._browse("intro_xlsx")).grid(
-            row=12, column=2, **PAD)
 
         ttk.Label(self, text="Sheet name:", width=14, anchor="e").grid(
             row=13, column=0, sticky="e", padx=8, pady=(0, 6))
@@ -3637,7 +3752,7 @@ class PreferencesDialog(tk.Toplevel):
 
         ttk.Label(
             self,
-            text="Points to your Microscope Intro Course Log.xlsx.\n"
+            text="Microscope Intro Course Log.xlsx in the shared folder.\n"
                  "Used by the Class Schedule tab to log weekly class sessions.",
             foreground=self._fg2,
         ).grid(row=14, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
@@ -3698,9 +3813,28 @@ class PreferencesDialog(tk.Toplevel):
         ttk.Separator(self, orient="horizontal").grid(
             row=30, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
 
+        # ── Section: locked files ─────────────────────────────────────────────
+        ttk.Label(self, text="Locked Files", font=("", 10, "bold")).grid(
+            row=31, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 4))
+        ttk.Checkbutton(
+            self, text="Automatic exports: save a temporary time-stamped file "
+                       "when the xlsx is locked",
+            variable=self._pending_var,
+        ).grid(row=32, column=0, columnspan=4, sticky="w", padx=12, pady=4)
+        ttk.Label(
+            self,
+            text="Temporary files are named  <name>.pending_YYYYMMDD_HHMMSS.xlsx  in the\n"
+                 "shared folder; merge them with  python consolidate_pending.py.\n"
+                 "Manual exports always ask. Otherwise the app retries every 5 minutes.",
+            foreground=self._fg2,
+        ).grid(row=33, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 6))
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=34, column=0, columnspan=4, sticky="ew", padx=10, pady=4)
+
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = ttk.Frame(self, padding=(8, 4, 12, 10))
-        btn_row.grid(row=31, column=0, columnspan=4, sticky="e")
+        btn_row.grid(row=35, column=0, columnspan=4, sticky="e")
         ttk.Button(btn_row, text="Save", command=self._save,
                    width=10).pack(side="right", padx=(6, 0))
         ttk.Button(btn_row, text="Cancel", command=self.destroy,
@@ -3712,46 +3846,35 @@ class PreferencesDialog(tk.Toplevel):
         py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{max(0, px)}+{max(0, py)}")
 
-    def _browse_data_file(self) -> None:
-        path = filedialog.askopenfilename(
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            title="Locate existing ilab_requests_cache.csv",
+    def _browse_shared_dir(self) -> None:
+        path = filedialog.askdirectory(
+            title="Select the shared iLab Request Manager folder",
+            initialdir=self._vars["shared_dir"].get() or None,
         )
         if path:
-            self._vars["data_file"].set(path)
-
-    def _browse(self, key: str) -> None:
-        if "intro" in key:
-            label = "Microscope Intro Course Log"
-        elif "calm" in key:
-            label = "CALM Training Schedule"
-        else:
-            label = "CVRI Training Schedule"
-        path = filedialog.askopenfilename(
-            filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")],
-            title=f"Select {label} xlsx",
-        )
-        if path:
-            self._vars[key].set(path)
+            self._vars["shared_dir"].set(path.replace("/", "\\"))
 
     def _save(self) -> None:
         self._vars["sync_on_open"].set("1" if self._open_var.get() else "0")
-        # Store file locations as absolute paths
-        for key in ("data_file", "calm_xlsx", "cvri_xlsx", "intro_xlsx",
-                    "class_session_file"):
-            self._vars[key].set(_prefs.abs_path(self._vars[key].get()))
+        self._vars["pending_on_lock"].set("1" if self._pending_var.get() else "0")
+        # The xlsx/CSV paths are derived from the shared folder on save/load
+        # (prefs.save_prefs), so only the folder itself needs normalising.
+        self._vars["shared_dir"].set(
+            self._vars["shared_dir"].get().strip() or _prefs.DEFAULT_SHARED_DIR)
+        self._vars["class_session_file"].set(
+            _prefs.abs_path(self._vars["class_session_file"].get()))
         for key in ("idle_sync_minutes", "records_sync_minutes", "ilab_sync_minutes"):
             try:
                 self._vars[key].set(str(max(0, int(float(self._vars[key].get() or 0)))))
             except ValueError:
                 self._vars[key].set("0")
-        new_data_file = self._vars["data_file"].get().strip()
+        new_data_file = self._vars["shared_dir"].get().strip()
         _prefs.save_prefs({k: v.get() for k, v in self._vars.items()})
         self.destroy()
         if new_data_file != self._original_data_file:
             messagebox.showinfo(
                 "Restart Required",
-                "The Data File path has changed.\n\n"
+                "The shared folder has changed.\n\n"
                 "Please restart the app to load data from the new location.",
             )
 

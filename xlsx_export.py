@@ -117,6 +117,8 @@ def _existing_row_signatures(ws, headers: list) -> set:
 def _save_workbook(wb, xlsx_path: str) -> None:
     """Save *wb*, turning a Windows file-lock error into a message that makes
     the cause (file open in Excel) obvious to the caller/UI."""
+    import prefs
+    prefs.make_writable(Path(xlsx_path))      # shared copies must be read/write
     try:
         wb.save(xlsx_path)
     except PermissionError:
@@ -125,6 +127,52 @@ def _save_workbook(wb, xlsx_path: str) -> None:
             "program) and can't be saved right now. Close the file and try "
             "again — your data has not been lost."
         ) from None
+
+
+# ── Temporary time-stamped copies (used when the real file is locked) ────────
+
+def pending_path(xlsx_path: str) -> str:
+    """A new time-stamped sibling of *xlsx_path*, e.g.
+    ``Training Schedule_CALM_CURRENT.pending_20261021_101500.xlsx``."""
+    import datetime as _dt
+    p = Path(xlsx_path)
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    cand = p.with_name(f"{p.stem}.pending_{stamp}{p.suffix}")
+    n = 1
+    while cand.exists():                       # two saves within one second
+        cand = p.with_name(f"{p.stem}.pending_{stamp}-{n}{p.suffix}")
+        n += 1
+    return str(cand)
+
+
+def pending_files(xlsx_path: str) -> list:
+    """Existing pending copies of *xlsx_path* that are not consolidated yet."""
+    p = Path(xlsx_path)
+    return sorted(p.parent.glob(f"{p.stem}.pending_*{p.suffix}"))
+
+
+def seed_pending(src_xlsx: str, dst_xlsx: str, sheet_name: str = "") -> None:
+    """Create *dst_xlsx* holding only the header row of *src_xlsx* (reading
+    works even while Excel has the file open), so rows appended to it line up
+    with the real file's columns."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = sheet_name or "Pending"
+    if Path(src_xlsx).exists():
+        src = openpyxl.load_workbook(src_xlsx, read_only=True, data_only=True)
+        try:
+            sws = (src[sheet_name] if sheet_name and sheet_name in src.sheetnames
+                   else src.active)
+            ws.title = sws.title
+            first = next(sws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            headers = [("" if h is None else str(h).strip()) for h in first]
+            while headers and not headers[-1]:
+                headers.pop()
+            if headers:
+                _write_headers(ws, headers)
+        finally:
+            src.close()
+    wb.save(dst_xlsx)
 
 
 class _LocalSheet:
@@ -164,19 +212,18 @@ class _LocalSheet:
         _save_workbook(self.wb, self.path)
 
 
-class _GraphSheet:
-    """Excel Online worksheet reached through Microsoft Graph (URL target)."""
+class _FlowSheet:
+    """Excel Online table reached through a Power Automate flow (URL target)."""
 
     def __init__(self, url: str, sheet_name: str, default_title: str):
-        from graph_excel import GraphSheet
-        self.sheet = GraphSheet(url, sheet_name)
-        self._rows = None
+        from Powerautomatedata.flow_excel import FlowSheet
+        self.sheet = FlowSheet(url, sheet_name)
 
     def headers(self) -> list:
         return self.sheet.headers()
 
     def write_headers(self, headers: list) -> None:
-        self.sheet.write_rows(1, [headers])
+        self.sheet.write_headers(headers)
 
     def signatures(self, headers: list) -> set:
         return self.sheet.row_signatures(len(headers))
@@ -188,10 +235,19 @@ class _GraphSheet:
         pass     # each append is already committed
 
 
+def _is_flow_url(target: str) -> bool:
+    """True for a Power Automate / Excel Online URL target.  Local (shared
+    drive) files are the normal case; the flow module is optional."""
+    try:
+        from Powerautomatedata.flow_excel import is_flow_url
+    except ImportError:
+        return False
+    return is_flow_url(target)
+
+
 def _open_sheet(target: str, sheet_name: str, default_title: str):
-    from graph_excel import is_graph_url
-    if is_graph_url(target):
-        return _GraphSheet(target, sheet_name, default_title)
+    if _is_flow_url(target):
+        return _FlowSheet(target, sheet_name, default_title)
     return _LocalSheet(target, sheet_name, default_title)
 
 
@@ -390,7 +446,7 @@ def _class_cell_text(v, field: str) -> str:
     if isinstance(v, _dt.date):
         return v.isoformat()
     if isinstance(v, (int, float)) and field == "date" and v > 20000:
-        # Excel serial date (Microsoft Graph returns these)
+        # Excel serial date (Power Automate returns these)
         return (_dt.date(1899, 12, 30) + _dt.timedelta(days=int(v))).isoformat()
     if isinstance(v, float) and v.is_integer():
         v = int(v)
@@ -413,10 +469,9 @@ def read_class_sessions(xlsx_path: str, sheet_name: str = "") -> list[dict]:
     """
     if not HAS_OPENPYXL:
         raise ImportError("openpyxl is required.  Install it with:  pip install openpyxl")
-    from graph_excel import is_graph_url
-    if is_graph_url(xlsx_path):
-        from graph_excel import GraphSheet
-        rows = GraphSheet(xlsx_path, sheet_name).read_values()
+    if _is_flow_url(xlsx_path):
+        from Powerautomatedata.flow_excel import FlowSheet
+        rows = FlowSheet(xlsx_path, sheet_name).read_values()
     else:
         if not Path(xlsx_path).exists():
             return []
