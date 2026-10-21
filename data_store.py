@@ -11,6 +11,7 @@ export_expanded() flattens form_data fields into individual columns.
 import csv
 import json
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -82,18 +83,24 @@ ALL_COLS = _FIXED_COLS + _LOCAL_COLS + _BLOB_COLS
 class DataStore:
     def __init__(self, filepath: str = "ilab_requests_cache.csv",
                  remote_sheet: str = "Cache"):
-        """*filepath* is a local CSV, or an Excel Online URL (OneDrive /
-        SharePoint).  In the URL case the workbook's *remote_sheet* worksheet
+        """*filepath* is a local CSV, or an Power Automate flow URL (Excel
+        Online table).  In the URL case the workbook's *remote_sheet* worksheet
         is the shared source of truth and a local CSV mirror is kept for
         offline start-up."""
-        from graph_excel import is_graph_url, GraphSheet
+        try:
+            from Powerautomatedata.flow_excel import is_flow_url, FlowSheet
+        except ImportError:        # Excel Online support not installed
+            def is_flow_url(_target: str) -> bool:
+                return False
+            FlowSheet = None
         self.remote = None
-        if is_graph_url(str(filepath)):
-            self.remote = GraphSheet(str(filepath), remote_sheet or "Cache")
+        if is_flow_url(str(filepath)):
+            self.remote = FlowSheet(str(filepath), remote_sheet or "Cache")
             filepath = Path(__file__).resolve().parent / "ilab_requests_cache_mirror.csv"
         self.filepath = Path(filepath)
         self.records: Dict[str, dict] = {}
         self.on_change: Optional[Callable[[], None]] = None  # set by app for auto-save
+        self.on_save_locked: Optional[Callable[[str], None]] = None  # CSV locked on save
         # Remote-sync state (Excel Online mode)
         self.on_remote_status: Optional[Callable[[str, bool], None]] = None
         self.remote_error: str = ""
@@ -147,7 +154,7 @@ class DataStore:
             if req_id not in self.records:
                 self.records[req_id] = disk_rec
 
-    # ── Excel Online (Microsoft Graph) ────────────────────────────────────────
+    # ── Excel Online (Power Automate) ────────────────────────────────────────
 
     @staticmethod
     def _row_tuple(rec: dict) -> tuple:
@@ -250,13 +257,37 @@ class DataStore:
                 self._report_remote(f"Excel Online push failed: {exc}", True)
 
     def _write_mirror(self) -> None:
-        with open(self.filepath, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=ALL_COLS, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(list(self.records.values()))
+        import prefs
+        # Shared copy must be read/write; a brief lock (another user saving,
+        # or the CSV open in Excel) is retried before giving up.
+        prefs.make_writable(self.filepath)
+        for attempt in range(4):
+            try:
+                with open(self.filepath, "w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=ALL_COLS,
+                                            extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(list(self.records.values()))
+                return
+            except PermissionError:
+                if attempt == 3:
+                    raise PermissionError(
+                        f"'{self.filepath.name}' is locked (open in Excel or "
+                        "another program) and can't be saved right now."
+                    ) from None
+                time.sleep(0.5)
 
     def save(self) -> None:
-        self._write_mirror()
+        try:
+            self._write_mirror()
+        except PermissionError:
+            # Locked shared file.  The records stay safe in memory; the app
+            # (on_save_locked) retries the save later.  Without a handler,
+            # surface the error as before.
+            if self.on_save_locked is None:
+                raise
+            self.on_save_locked(f"{self.filepath.name} is locked")
+            return
         if self.remote is not None:
             self._push_async()
 
