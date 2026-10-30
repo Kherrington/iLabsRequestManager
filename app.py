@@ -495,7 +495,6 @@ class ILabManagerApp:
             "service_name", "state", "assigned_to", "labels",
             "core_lab", "microscope",
             "training_date", "training_day", "training_time",
-            "class_taken",
         ]
         headers = {
             "request_id":    ("ID",          75),
@@ -511,7 +510,6 @@ class ILabManagerApp:
             "training_date": ("Trng Date",    88),
             "training_day":  ("Day",          52),
             "training_time": ("Time",         68),
-            "class_taken":   ("Class",        46),
         }
 
         # Merged group-header strip above the column headings
@@ -1048,6 +1046,7 @@ class ILabManagerApp:
                             getattr(self, "_class_taken_chk_track", None)):
                     if chk:
                         chk.config(state=chk_state)
+            self._apply_class_availability(self._current_rec)
 
         def _chk(parent, key, label, url=None):
             """Build one checkbox row, with an optional hyperlink on the label."""
@@ -1093,11 +1092,15 @@ class ILabManagerApp:
         class_row = ttk.Frame(pre)
         class_row.pack(anchor="w", pady=3)
         ttk.Label(class_row, text="Class?").pack(side="left", padx=(0, 6))
-        ttk.Checkbutton(class_row, variable=self._wf_vars["wf_class_scheduled"],
-                        command=_save_wf).pack(side="left")
+        self._class_yes_chk = ttk.Checkbutton(
+            class_row, variable=self._wf_vars["wf_class_scheduled"],
+            command=_save_wf)
+        self._class_yes_chk.pack(side="left")
         ttk.Label(class_row, text="Yes").pack(side="left", padx=(0, 10))
-        ttk.Checkbutton(class_row, variable=self._wf_vars["wf_not_required"],
-                        command=_save_wf).pack(side="left")
+        self._class_no_chk = ttk.Checkbutton(
+            class_row, variable=self._wf_vars["wf_not_required"],
+            command=_save_wf)
+        self._class_no_chk.pack(side="left")
         ttk.Label(class_row, text="No").pack(side="left")
 
         # if yes → Class Taken (indented)
@@ -2010,7 +2013,6 @@ class ILabManagerApp:
                     rec.get("training_date", ""),
                     rec.get("training_day", ""),
                     rec.get("training_time", ""),
-                    "☑" if rec.get("class_taken") == "1" else "☐",
                 ),
                 tags=(state + ("_alt" if _row_idx % 2 else ""),),
             )
@@ -2107,6 +2109,34 @@ class ILabManagerApp:
         exported = rec.get("schedule_exported", "0") == "1"
         self._exported_lbl.config(
             text="✓ Exported to schedule" if exported else "Not yet exported")
+        self._apply_class_availability(rec)
+
+    @staticmethod
+    def _is_training_request(rec: dict) -> bool:
+        return "training" in (rec.get("service_name") or "").lower()
+
+    def _apply_class_availability(self, rec: dict) -> None:
+        """Grey out every class control unless the request is a training request."""
+        if self._is_training_request(rec):
+            # normal state for Class Taken was applied by the caller; just
+            # undo any earlier grey-out of the Yes/No boxes
+            for chk in (getattr(self, "_class_yes_chk", None),
+                        getattr(self, "_class_no_chk", None)):
+                if chk:
+                    chk.config(state="normal")
+            return
+        for chk in (getattr(self, "_class_taken_chk", None),
+                    getattr(self, "_class_taken_chk_track", None),
+                    getattr(self, "_class_yes_chk", None),
+                    getattr(self, "_class_no_chk", None)):
+            if chk:
+                chk.config(state="disabled")
+        if hasattr(self, "_class_taken_lbl_track"):
+            self._class_taken_lbl_track.config(foreground="#9E9E9E")
+        if hasattr(self, "_class_status_lbl"):
+            self._class_status_lbl.config(
+                text="Not a training request — class not applicable.",
+                foreground="#9E9E9E")
 
 
     # =========================================================================
@@ -2237,14 +2267,6 @@ class ILabManagerApp:
             self._show_labels_popup(row_id, event.x_root, event.y_root)
         elif col_name == "training_date":
             self._on_training_date_pick()
-        elif col_name == "class_taken":
-            # Toggle directly without needing the detail panel checkbox
-            if self._current_rec and self._current_rec.get("request_id") == row_id:
-                if self._current_rec.get("class_taken", "0") == "1":
-                    return  # charge already submitted — block re-click
-                new_state = self._current_rec.get("class_taken", "0") != "1"
-                self._class_taken_var.set(new_state)
-                self._on_class_taken_toggle()
 
     def _show_cell_combo(self, row_id: str, col_id: str,
                          field: str, values: list,
