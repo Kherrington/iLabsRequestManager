@@ -35,3 +35,7 @@ CALM_welcome.txt
 
 #.csv files
 ilab_requests_cache.csv
+
+# Secrets / local mirrors
+.env
+irm-clean.git/
